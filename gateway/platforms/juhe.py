@@ -8,11 +8,9 @@ WeWork/enterprise WeChat, WebSocket callbacks, and text messages.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
-import random
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +30,24 @@ except ImportError:  # pragma: no cover - dependency gate
     httpx = None  # type: ignore[assignment]
     HTTPX_AVAILABLE = False
 
+try:
+    from qwsaas import JuheWsClient, QwSaasClient
+    from qwsaas.callbacks import (
+        NOTIFY_BATCH_NEW_MESSAGE,
+        NOTIFY_NEW_MESSAGE,
+        TEXT_MESSAGE_TYPE,
+        parse_callback_envelope,
+        parse_callback_event,
+    )
+
+    QWSAAS_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency gate
+    JuheWsClient = None  # type: ignore[assignment]
+    QwSaasClient = None  # type: ignore[assignment]
+    parse_callback_envelope = None  # type: ignore[assignment]
+    parse_callback_event = None  # type: ignore[assignment]
+    QWSAAS_AVAILABLE = False
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.platforms.helpers import MessageDeduplicator
@@ -41,8 +57,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASE_URL = "https://chat-api.juhebot.com"
 DEFAULT_WS_URL = "wss://chat-api.juhebot.com/ws/juwe"
 
-NOTIFY_NEW_MESSAGE = 11010
-NOTIFY_BATCH_NEW_MESSAGE = 11013
 MSG_TYPE_REVOKE = 1
 MSG_TYPE_TEXT = 2
 MSG_TYPE_LOCATION = 3
@@ -87,13 +101,12 @@ MSG_TYPE_LABELS = {
 
 DEDUP_TTL_SECONDS = 30 * 60
 DEDUP_MAX_SIZE = 1000
-REQUEST_TIMEOUT_SECONDS = 30.0
 RECONNECT_BACKOFF_SECONDS = [2, 5, 10, 30, 60]
 
 
 def check_juhe_requirements() -> bool:
     """Return True when Juhe runtime dependencies are available."""
-    return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
+    return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE and QWSAAS_AVAILABLE
 
 
 def _coerce_list(value: Any) -> List[str]:
@@ -220,9 +233,9 @@ class JuheAdapter(BasePlatformAdapter):
             default=False,
         )
 
-        self._session: Optional["aiohttp.ClientSession"] = None
-        self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
-        self._http_client: Optional["httpx.AsyncClient"] = None
+        self._ws = None
+        self._sdk_client: Optional["QwSaasClient"] = None
+        self._ws_client: Optional["JuheWsClient"] = None
         self._listen_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE, ttl_seconds=DEDUP_TTL_SECONDS)
 
@@ -241,6 +254,11 @@ class JuheAdapter(BasePlatformAdapter):
             self._set_fatal_error("juhe_missing_dependency", message, retryable=True)
             logger.warning("[%s] %s", self.name, message)
             return False
+        if not QWSAAS_AVAILABLE:
+            message = "Juhe startup failed: qwsaas SDK not installed"
+            self._set_fatal_error("juhe_missing_dependency", message, retryable=True)
+            logger.warning("[%s] %s", self.name, message)
+            return False
         if not self._app_key or not self._app_secret or not self._guid:
             message = "Juhe startup failed: JUHE_APP_KEY, JUHE_APP_SECRET, and JUHE_GUID are required"
             self._set_fatal_error("juhe_missing_credentials", message, retryable=True)
@@ -248,8 +266,15 @@ class JuheAdapter(BasePlatformAdapter):
             return False
 
         try:
-            self._http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True)
-            await self._open_connection()
+            self._sdk_client = self._build_sdk_client()
+            self._ws_client = JuheWsClient(
+                app_key=self._app_key,
+                app_secret=self._app_secret,
+                guid=self._guid,
+                ws_url=self._ws_url,
+                reconnect_backoff_seconds=tuple(RECONNECT_BACKOFF_SECONDS),
+            )
+            await self._ws_client.connect()
             self._mark_connected()
             self._listen_task = asyncio.create_task(self._listen_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
@@ -275,56 +300,23 @@ class JuheAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
 
-    async def _open_connection(self) -> None:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        self._ws = await self._session.ws_connect(self._ws_url, heartbeat=30)
-        await self._ws.send_json({
-            "type": "auth",
-            "app_key": self._app_key,
-            "app_secret": self._app_secret,
-            "guid": self._guid,
-        })
-
     async def _cleanup(self) -> None:
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
+        if self._ws_client:
+            await self._ws_client.close()
+        self._ws_client = None
         self._ws = None
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
-        if self._http_client:
-            await self._http_client.aclose()
-            self._http_client = None
-
-    async def _close_ws_only(self) -> None:
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
+        self._sdk_client = None
 
     async def _listen_loop(self) -> None:
-        backoff_index = 0
-        while self._running:
-            try:
-                if self._ws is None or self._ws.closed:
-                    await self._open_connection()
-                msg = await self._ws.receive()
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    backoff_index = 0
-                    payload = json.loads(msg.data)
-                    await self._dispatch_ws_payload(payload)
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                    raise RuntimeError("Juhe WebSocket closed")
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                if not self._running:
-                    break
-                logger.warning("[%s] WebSocket receive/reconnect error: %s", self.name, exc)
-                await self._close_ws_only()
-                delay = RECONNECT_BACKOFF_SECONDS[min(backoff_index, len(RECONNECT_BACKOFF_SECONDS) - 1)]
-                backoff_index = min(backoff_index + 1, len(RECONNECT_BACKOFF_SECONDS) - 1)
-                await asyncio.sleep(delay + random.uniform(0, 0.5))
+        if self._ws_client is None:
+            return
+        try:
+            await self._ws_client.listen_forever(self._dispatch_ws_payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._running:
+                logger.warning("[%s] WebSocket receive loop stopped: %s", self.name, exc)
 
     # ------------------------------------------------------------------
     # WebSocket/callback dispatch
@@ -344,31 +336,24 @@ class JuheAdapter(BasePlatformAdapter):
         if msg_type != "callback":
             return True
 
-        event_id = payload.get("event_id")
-        event = self._coerce_callback_event(payload.get("event"))
-        if event is None:
-            event = self._coerce_callback_event(payload.get("data"))
-        if event is None and isinstance(payload, dict):
-            event = self._coerce_callback_event(payload)
+        parsed = parse_callback_envelope(payload) if parse_callback_envelope else None
         if self._trace_payloads:
             logger.info(
                 "[%s] callback envelope event_id=%s parsed_event=%s",
                 self.name,
-                event_id,
-                _preview_json(event),
+                payload.get("event_id"),
+                _preview_json(parsed.raw_event if parsed else None),
             )
-        success = await self._handle_callback_event(event)
-        await self._send_ack(event_id, success)
+        success = await self._handle_parsed_callback(parsed)
+        await self._send_ack(payload.get("event_id"), success)
         return success
 
     async def _send_ack(self, event_id: Any, success: bool) -> None:
-        if not self._ws or self._ws.closed:
+        if self._ws_client is not None:
+            await self._ws_client.ack(event_id, success)
             return
-        await self._ws.send_json({
-            "type": "ack",
-            "event_id": event_id,
-            "success": success,
-        })
+        if self._ws and not self._ws.closed:
+            await self._ws.send_json({"type": "ack", "event_id": event_id, "success": success})
 
     async def _handle_callback_event(self, event: Any) -> bool:
         if not isinstance(event, dict):
@@ -393,65 +378,51 @@ class JuheAdapter(BasePlatformAdapter):
             if self._trace_payloads:
                 logger.info("[%s] Ignoring callback notify_type=%s", self.name, notify_type)
             return True
+        parsed = parse_callback_event(event) if parse_callback_event else None
+        return await self._handle_parsed_callback(parsed)
 
-        data = event.get("data")
-        if notify_type == NOTIFY_BATCH_NEW_MESSAGE and isinstance(data, list):
-            messages = data
-        elif isinstance(data, list):
-            messages = data
-        elif isinstance(data, dict):
-            messages = [data]
-        else:
+    async def _handle_parsed_callback(self, parsed: Any) -> bool:
+        if parsed is None:
+            logger.warning("[%s] Ignoring malformed callback event", self.name)
+            return False
+        if str(parsed.guid or "").strip() != self._guid:
             logger.warning(
-                "[%s] Callback notify_type=%s has unsupported data payload type=%s",
+                "[%s] Ignoring callback for mismatched guid (expected=%s got=%s)",
                 self.name,
-                notify_type,
-                type(data).__name__,
+                self._guid,
+                str(parsed.guid or "").strip(),
             )
+            return False
+        if parsed.notify_type not in {NOTIFY_NEW_MESSAGE, NOTIFY_BATCH_NEW_MESSAGE}:
+            if self._trace_payloads:
+                logger.info("[%s] Ignoring callback notify_type=%s", self.name, parsed.notify_type)
+            return True
+        if not parsed.messages:
+            logger.warning("[%s] Callback notify_type=%s does not contain messages", self.name, parsed.notify_type)
             return False
 
         ok = True
-        for message in messages:
-            ok = await self._process_message(message, event) and ok
+        for message in parsed.messages:
+            ok = await self._process_sdk_message(message) and ok
         return ok
 
-    @staticmethod
-    def _coerce_callback_event(event: Any) -> Optional[Dict[str, Any]]:
-        if isinstance(event, dict):
-            return event
-        if isinstance(event, str):
-            text = event.strip()
-            if not text:
-                return None
-            try:
-                parsed = json.loads(text)
-            except (TypeError, ValueError):
-                return None
-            return parsed if isinstance(parsed, dict) else None
-        return None
-
-    async def _process_message(self, message: Any, event: Dict[str, Any]) -> bool:
-        if not isinstance(message, dict):
-            logger.warning("[%s] Ignoring non-dict message payload type=%s", self.name, type(message).__name__)
+    async def _process_sdk_message(self, message: Any) -> bool:
+        sender_id = str(message.sender_id or "").strip()
+        if not sender_id:
+            logger.warning("[%s] Ignoring message without sender: %s", self.name, _preview_json(message.raw_message))
             return False
 
-        if _is_self_echo_message(message):
+        if bool(message.is_self_echo):
             if self._trace_payloads:
-                logger.info("[%s] Ignoring self echo message id=%s", self.name, message.get("id") or message.get("seq"))
+                logger.info("[%s] Ignoring self echo message id=%s", self.name, message.message_id)
             return True
 
-        sender_id = self._extract_sender_id(message)
-        if not sender_id:
-            logger.warning("[%s] Ignoring message without sender: %s", self.name, _preview_json(message))
-            return False
-
-        is_group = self._is_group_message(message)
+        is_group = bool(message.is_group)
         if is_group:
-            raw_chat_id = self._extract_group_id(message)
-            if not raw_chat_id:
-                logger.warning("[%s] Group message missing group id: %s", self.name, _preview_json(message))
+            chat_id = str(message.conversation_id or "").strip()
+            if not chat_id:
+                logger.warning("[%s] Group message missing group id: %s", self.name, _preview_json(message.raw_message))
                 return False
-            chat_id = _prefixed_group(raw_chat_id)
             if not self._is_group_allowed(chat_id, sender_id):
                 if self._trace_payloads:
                     logger.info(
@@ -461,7 +432,7 @@ class JuheAdapter(BasePlatformAdapter):
                         chat_id,
                     )
                 return True
-            if not self._passes_mention_gate(chat_id, self._extract_at_list(message)):
+            if not self._passes_mention_gate(chat_id, list(message.at_list)):
                 if self._trace_payloads:
                     logger.info("[%s] Ignoring group message without required mention chat=%s", self.name, chat_id)
                 return True
@@ -472,13 +443,13 @@ class JuheAdapter(BasePlatformAdapter):
                 if self._trace_payloads:
                     logger.info("[%s] Ignoring DM due to allowlist sender=%s", self.name, sender_id)
                 return True
-            chat_id = _prefixed_dm(sender_id)
+            chat_id = str(message.conversation_id or _prefixed_dm(sender_id))
             chat_type = "dm"
-            chat_name = str(message.get("sender_name") or sender_id)
+            chat_name = str(message.sender_name or sender_id)
 
-        msg_type = self._message_type(message)
-        text = self._extract_text(message, msg_type)
-        message_id = self._message_id(message, event, sender_id, text)
+        msg_type = int(message.message_type)
+        text = str(message.text or "")
+        message_id = str(message.message_id or "")
         if self._dedup.is_duplicate(message_id):
             if self._trace_payloads:
                 logger.info("[%s] Dropping duplicate message id=%s", self.name, message_id)
@@ -512,108 +483,19 @@ class JuheAdapter(BasePlatformAdapter):
             chat_name=chat_name,
             chat_type=chat_type,
             user_id=sender_id,
-            user_name=str(message.get("sender_name") or sender_id),
+            user_name=str(message.sender_name or sender_id),
         )
         inbound = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
-            raw_message=message,
+            raw_message=message.raw_message,
             message_id=message_id,
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s chat=%s type=%s", self.name, sender_id, chat_id, chat_type)
         await self.handle_message(inbound)
         return True
-
-    @staticmethod
-    def _message_type(message: Dict[str, Any]) -> int:
-        try:
-            return int(
-                message.get("msg_type")
-                or message.get("msgtype")
-                or message.get("content_type")
-                or message.get("type")
-                or TEXT_MESSAGE_TYPE
-            )
-        except (TypeError, ValueError):
-            return TEXT_MESSAGE_TYPE
-
-    @staticmethod
-    def _extract_sender_id(message: Dict[str, Any]) -> str:
-        from_user = message.get("from_user") if isinstance(message.get("from_user"), dict) else {}
-        sender = (
-            message.get("chatroom_sender")
-            or message.get("from_username")
-            or message.get("sender")
-            or message.get("sender_id")
-            or message.get("wxid")
-            or from_user.get("id")
-            or ""
-        )
-        return _strip_target_prefix(str(sender).strip())
-
-    @staticmethod
-    def _extract_group_id(message: Dict[str, Any]) -> str:
-        group_id = (
-            message.get("chat_id")
-            or message.get("room_id")
-            or message.get("roomid")
-            or message.get("chatroom")
-            or ""
-        )
-        if _is_zero_like_id(group_id):
-            return ""
-        return _strip_target_prefix(str(group_id).strip())
-
-    @staticmethod
-    def _is_group_message(message: Dict[str, Any]) -> bool:
-        if message.get("is_group") or message.get("is_chatroom_msg"):
-            return True
-        return bool(JuheAdapter._extract_group_id(message))
-
-    @staticmethod
-    def _extract_at_list(message: Dict[str, Any]) -> List[str]:
-        at_list = message.get("at_list") or []
-        if isinstance(at_list, str):
-            return [item.strip() for item in at_list.split(",") if item.strip()]
-        if isinstance(at_list, (list, tuple, set)):
-            return [str(item).strip() for item in at_list if str(item).strip()]
-        return []
-
-    @staticmethod
-    def _extract_text(message: Dict[str, Any], msg_type: int) -> str:
-        if msg_type != TEXT_MESSAGE_TYPE:
-            return ""
-        raw = message.get("content")
-        if raw is None:
-            raw = message.get("msg", "")
-        if isinstance(raw, dict):
-            return str(raw.get("msg") or raw.get("text") or "").strip()
-        text = str(raw or "")
-        try:
-            parsed = json.loads(text)
-        except (TypeError, ValueError):
-            return text.strip()
-        if isinstance(parsed, dict):
-            nested = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
-            return str(parsed.get("msg") or parsed.get("text") or nested.get("msg") or "").strip()
-        return text.strip()
-
-    @staticmethod
-    def _message_id(message: Dict[str, Any], event: Dict[str, Any], sender_id: str, text: str) -> str:
-        for key in ("msg_id", "msgid", "message_id", "id", "seq"):
-            value = message.get(key)
-            if value:
-                return str(value)
-        stable = "|".join([
-            str(event.get("guid") or ""),
-            str(message.get("timestamp") or message.get("sendtime") or ""),
-            sender_id,
-            str(message.get("roomid") or message.get("room_id") or message.get("chat_id") or ""),
-            text,
-        ])
-        return hashlib.sha1(stable.encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------------
     # Policy helpers
@@ -701,44 +583,31 @@ class JuheAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=str(result.get("message_id") or ""))
 
     async def _guid_request(self, *, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        owns_client = False
-        client = self._http_client
-        if client is None:
-            client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True)
-            owns_client = True
-        try:
-            response = await client.post(
-                f"{self._base_url}/open/GuidRequest",
-                json={
-                    "app_key": self._app_key,
-                    "app_secret": self._app_secret,
-                    "path": path,
-                    "data": data,
-                },
-            )
-            response.raise_for_status()
-            body = response.json()
-        finally:
-            if owns_client:
-                await client.aclose()
-
-        base_response = body.get("baseResponse") if isinstance(body, dict) else {}
-        err_code = None
-        if isinstance(body, dict):
-            if isinstance(body.get("list"), list) and body["list"]:
-                err_code = body["list"][0].get("ret")
-            if err_code is None and isinstance(base_response, dict):
-                err_code = base_response.get("ret")
-            if err_code is None:
-                err_code = body.get("error_code", 0)
+        client = self._get_sdk_client()
+        request_data = dict(data)
+        request_data.pop("guid", None)
+        body = await client._request_public(path, request_data)
+        response_data = body.get("data") if isinstance(body.get("data"), dict) else {}
         return {
-            "err_code": 0 if err_code is None else err_code,
-            "err_msg": (
-                base_response.get("errMsg") if isinstance(base_response, dict) else None
-            ) or (body.get("errMsg") if isinstance(body, dict) else None),
+            "err_code": int(body.get("error_code") or 0),
+            "err_msg": str(body.get("error_message") or body.get("errMsg") or ""),
+            "message_id": str(body.get("message_id") or response_data.get("message_id") or ""),
             "data": body,
         }
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_type = "group" if str(chat_id).upper().startswith("R:") else "dm"
         return {"name": str(chat_id), "type": chat_type, "chat_id": str(chat_id)}
+
+    def _build_sdk_client(self) -> "QwSaasClient":
+        return QwSaasClient(
+            app_key=self._app_key,
+            app_secret=self._app_secret,
+            guid=self._guid,
+            public_base_url=self._base_url,
+        )
+
+    def _get_sdk_client(self) -> "QwSaasClient":
+        if self._sdk_client is None:
+            self._sdk_client = self._build_sdk_client()
+        return self._sdk_client
