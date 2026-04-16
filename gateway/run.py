@@ -2490,6 +2490,13 @@ class GatewayRunner:
                 return None
             return WeixinAdapter(config)
 
+        elif platform == Platform.JUHE:
+            from gateway.platforms.juhe import JuheAdapter, check_juhe_requirements
+            if not check_juhe_requirements():
+                logger.warning("Juhe: aiohttp/httpx not installed or JUHE credentials not set")
+                return None
+            return JuheAdapter(config)
+
         elif platform == Platform.MATTERMOST:
             from gateway.platforms.mattermost import MattermostAdapter, check_mattermost_requirements
             if not check_mattermost_requirements():
@@ -2553,6 +2560,8 @@ class GatewayRunner:
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
         if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+            return True
+        if source.platform == Platform.JUHE:
             return True
 
         user_id = source.user_id
@@ -6779,7 +6788,7 @@ class GatewayRunner:
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
-        Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
+        Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.JUHE, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
     async def _handle_debug_command(self, event: MessageEvent) -> str:

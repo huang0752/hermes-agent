@@ -333,6 +333,11 @@ PLATFORM_HINTS = {
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
+    "juhe": (
+        "You are communicating through Juhe, an enterprise WeChat bridge. "
+        "Use plain text formatting and avoid markdown-specific rendering assumptions. "
+        "In phase 1, Juhe supports text replies only."
+    ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "
         "cannot ask questions, request clarification, or wait for follow-up. Execute "

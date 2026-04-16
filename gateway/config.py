@@ -65,6 +65,7 @@ class Platform(Enum):
     WECOM = "wecom"
     WECOM_CALLBACK = "wecom_callback"
     WEIXIN = "weixin"
+    JUHE = "juhe"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
 
@@ -263,6 +264,14 @@ class GatewayConfig:
         connected = []
         for platform, config in self.platforms.items():
             if not config.enabled:
+                continue
+            if platform == Platform.JUHE:
+                if (
+                    config.extra.get("app_key")
+                    and config.extra.get("app_secret")
+                    and config.extra.get("guid")
+                ):
+                    connected.append(platform)
                 continue
             # Weixin requires both a token and an account_id
             if platform == Platform.WEIXIN:
@@ -1053,6 +1062,41 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "host": os.getenv("WECOM_CALLBACK_HOST", "0.0.0.0"),
             "port": int(os.getenv("WECOM_CALLBACK_PORT", "8645")),
         })
+
+    # Juhe (enterprise WeChat via juhebot)
+    juhe_app_key = os.getenv("JUHE_APP_KEY")
+    juhe_app_secret = os.getenv("JUHE_APP_SECRET")
+    juhe_guid = os.getenv("JUHE_GUID")
+    if juhe_app_key and juhe_app_secret and juhe_guid:
+        if Platform.JUHE not in config.platforms:
+            config.platforms[Platform.JUHE] = PlatformConfig()
+        config.platforms[Platform.JUHE].enabled = True
+        config.platforms[Platform.JUHE].extra.update({
+            "app_key": juhe_app_key,
+            "app_secret": juhe_app_secret,
+            "guid": juhe_guid,
+            "dm_policy": "allowlist",
+            "group_policy": "allowlist",
+        })
+        juhe_base_url = os.getenv("JUHE_BASE_URL", "").strip()
+        if juhe_base_url:
+            config.platforms[Platform.JUHE].extra["base_url"] = juhe_base_url.rstrip("/")
+        juhe_ws_url = os.getenv("JUHE_WEBSOCKET_URL", "").strip()
+        if juhe_ws_url:
+            config.platforms[Platform.JUHE].extra["websocket_url"] = juhe_ws_url.rstrip("/")
+        juhe_allowed = os.getenv("JUHE_ALLOWED_USERS", "").strip()
+        if juhe_allowed:
+            config.platforms[Platform.JUHE].extra["allow_from"] = juhe_allowed
+        juhe_groups = os.getenv("JUHE_GROUP_ALLOWED_CHATS", "").strip()
+        if juhe_groups:
+            config.platforms[Platform.JUHE].extra["group_allow_from"] = juhe_groups
+        juhe_home = os.getenv("JUHE_HOME_CHANNEL", "").strip()
+        if juhe_home:
+            config.platforms[Platform.JUHE].home_channel = HomeChannel(
+                platform=Platform.JUHE,
+                chat_id=juhe_home,
+                name=os.getenv("JUHE_HOME_CHANNEL_NAME", "Home"),
+            )
 
     # Weixin (personal WeChat via iLink Bot API)
     weixin_token = os.getenv("WEIXIN_TOKEN")

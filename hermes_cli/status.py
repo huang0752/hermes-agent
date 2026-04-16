@@ -303,6 +303,7 @@ def show_status(args):
         "Feishu": ("FEISHU_APP_ID", "FEISHU_HOME_CHANNEL"),
         "WeCom": ("WECOM_BOT_ID", "WECOM_HOME_CHANNEL"),
         "WeCom Callback": ("WECOM_CALLBACK_CORP_ID", None),
+        "Juhe": ("JUHE_APP_KEY", "JUHE_HOME_CHANNEL"),
         "Weixin": ("WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL"),
         "BlueBubbles": ("BLUEBUBBLES_SERVER_URL", "BLUEBUBBLES_HOME_CHANNEL"),
         "QQBot": ("QQ_APP_ID", "QQ_HOME_CHANNEL"),

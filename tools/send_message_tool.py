@@ -16,6 +16,14 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+try:
+    from gateway.platforms.juhe import JuheAdapter, check_juhe_requirements
+except Exception:  # pragma: no cover - optional import for direct-send helper
+    JuheAdapter = None  # type: ignore[assignment]
+
+    def check_juhe_requirements() -> bool:
+        return False
+
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
@@ -68,7 +76,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'juhe:S:1001'"
             },
             "message": {
                 "type": "string",
@@ -161,6 +169,7 @@ def _handle_send(args):
         "wecom": Platform.WECOM,
         "wecom_callback": Platform.WECOM_CALLBACK,
         "weixin": Platform.WEIXIN,
+        "juhe": Platform.JUHE,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
     }
@@ -246,6 +255,9 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
+    if platform_name == "juhe":
+        if target_ref.upper().startswith(("S:", "R:")):
+            return target_ref, None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
@@ -355,6 +367,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
+    if JuheAdapter is not None:
+        _MAX_LENGTHS[Platform.JUHE] = JuheAdapter.MAX_MESSAGE_LENGTH
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
@@ -386,6 +400,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # --- Weixin: use the native one-shot adapter helper for text + media ---
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+
+    if platform == Platform.JUHE and media_files:
+        return {"error": "Juhe send_message currently supports text-only delivery; MEDIA attachments are not supported"}
 
     # --- Non-Telegram platforms ---
     if media_files and not message.strip():
@@ -428,6 +445,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.JUHE:
+            result = await _send_juhe(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
@@ -947,6 +966,37 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
         )
     except Exception as e:
         return _error(f"Weixin send failed: {e}")
+
+
+async def _send_juhe(extra, chat_id, message):
+    """Send via Juhe using the adapter's WebSocket + HTTP pipeline."""
+    try:
+        from gateway.platforms.juhe import check_juhe_requirements as _runtime_check_juhe_requirements
+    except ImportError:
+        return {"error": "Juhe adapter not available."}
+
+    if not _runtime_check_juhe_requirements():
+        return {"error": "Juhe requirements not met. Need aiohttp + httpx."}
+    if JuheAdapter is None:
+        return {"error": "Juhe adapter not available."}
+
+    try:
+        from gateway.config import PlatformConfig
+
+        pconfig = PlatformConfig(enabled=True, extra=extra)
+        adapter = JuheAdapter(pconfig)
+        connected = await adapter.connect()
+        if not connected:
+            return _error(f"Juhe: failed to connect - {adapter.fatal_error_message or 'unknown error'}")
+        try:
+            result = await adapter.send(chat_id, message)
+            if not result.success:
+                return _error(f"Juhe send failed: {result.error}")
+            return {"success": True, "platform": "juhe", "chat_id": chat_id, "message_id": result.message_id}
+        finally:
+            await adapter.disconnect()
+    except Exception as e:
+        return _error(f"Juhe send failed: {e}")
 
 
 async def _send_bluebubbles(extra, chat_id, message):

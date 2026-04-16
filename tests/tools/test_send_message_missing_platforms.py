@@ -3,6 +3,7 @@
 import asyncio
 import os
 from types import SimpleNamespace
+from urllib.parse import quote
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tools.send_message_tool import (
@@ -123,7 +124,8 @@ class TestSendMatrix:
         session.put.assert_called_once()
         call_kwargs = session.put.call_args
         url = call_kwargs[0][0]
-        assert url.startswith("https://matrix.example.com/_matrix/client/v3/rooms/!room:example.com/send/m.room.message/")
+        encoded_room = quote("!room:example.com", safe="")
+        assert url.startswith(f"https://matrix.example.com/_matrix/client/v3/rooms/{encoded_room}/send/m.room.message/")
         assert call_kwargs[1]["headers"]["Authorization"] == "Bearer syt_tok"
         payload = call_kwargs[1]["json"]
         assert payload["msgtype"] == "m.text"
