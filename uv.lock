@@ -1787,6 +1787,10 @@ homeassistant = [
 honcho = [
     { name = "honcho-ai" },
 ]
+juhe = [
+    { name = "aiohttp" },
+    { name = "qwsaas" },
+]
 matrix = [
     { name = "aiosqlite" },
     { name = "asyncpg" },
@@ -1856,6 +1860,7 @@ yc-bench = [
 requires-dist = [
     { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = ">=0.9.0,<1.0" },
     { name = "aiohttp", marker = "extra == 'homeassistant'", specifier = ">=3.9.0,<4" },
+    { name = "aiohttp", marker = "extra == 'juhe'", specifier = ">=3.13.3,<4" },
     { name = "aiohttp", marker = "extra == 'messaging'", specifier = ">=3.13.3,<4" },
     { name = "aiohttp", marker = "extra == 'sms'", specifier = ">=3.9.0,<4" },
     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = ">=0.20" },
@@ -1926,6 +1931,7 @@ requires-dist = [
     { name = "python-telegram-bot", extras = ["webhooks"], marker = "extra == 'messaging'", specifier = ">=22.6,<23" },
     { name = "pywinpty", marker = "sys_platform == 'win32' and extra == 'pty'", specifier = ">=2.0.0,<3" },
     { name = "pyyaml", specifier = ">=6.0.2,<7" },
+    { name = "qwsaas", marker = "extra == 'juhe'", git = "ssh://git@github.com:22/huang0752/qwsaas.git?rev=v0.1.0" },
     { name = "requests", specifier = ">=2.33.0,<3" },
     { name = "rich", specifier = ">=14.3.3,<15" },
     { name = "simple-term-menu", marker = "extra == 'cli'", specifier = ">=1.0,<2" },
@@ -1941,7 +1947,7 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'rl'", specifier = ">=0.15.0,<1" },
     { name = "yc-bench", marker = "python_full_version >= '3.12' and extra == 'yc-bench'", git = "https://github.com/collinear-ai/yc-bench.git?rev=bfb0c88062450f46341bd9a5298903fc2e952a5c" },
 ]
-provides-extras = ["modal", "daytona", "dev", "messaging", "cron", "slack", "matrix", "cli", "tts-premium", "voice", "pty", "honcho", "mcp", "homeassistant", "sms", "acp", "mistral", "termux", "dingtalk", "feishu", "web", "rl", "yc-bench", "all"]
+provides-extras = ["modal", "daytona", "dev", "messaging", "juhe", "cron", "slack", "matrix", "cli", "tts-premium", "voice", "pty", "honcho", "mcp", "homeassistant", "sms", "acp", "mistral", "termux", "dingtalk", "feishu", "web", "rl", "yc-bench", "all"]
 
 [[package]]
 name = "hf-transfer"
@@ -4167,6 +4173,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/da/92/1446574745d74df0c92e6aa4a7b0b3130706a4142b2d1a5869f2eaa423c6/pyyaml-6.0.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65", size = 829923, upload-time = "2025-09-25T21:32:54.537Z" },
     { url = "https://files.pythonhosted.org/packages/f0/7a/1c7270340330e575b92f397352af856a8c06f230aa3e76f86b39d01b416a/pyyaml-6.0.3-cp314-cp314t-win_amd64.whl", hash = "sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9", size = 174062, upload-time = "2025-09-25T21:32:55.767Z" },
     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },
+]
+
+[[package]]
+name = "qwsaas"
+version = "0.1.0"
+source = { git = "ssh://git@github.com:22/huang0752/qwsaas.git?rev=v0.1.0#095de21805aae3cb5255bf0fea150d0f53d78cb9" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "httpx" },
 ]
 
 [[package]]

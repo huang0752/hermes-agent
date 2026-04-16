@@ -27,3 +27,19 @@ def test_matrix_extra_linux_only_in_all():
         if "matrix" in dep and "linux" in dep
     ]
     assert linux_gated, "expected hermes-agent[matrix] with sys_platform=='linux' marker in [all]"
+
+
+def test_juhe_extra_is_explicit_and_not_in_all():
+    """Private Juhe support should stay opt-in so upstream installs do not
+    break on a private dependency."""
+    optional_dependencies = _load_optional_dependencies()
+
+    assert "juhe" in optional_dependencies
+    juhe_extra = optional_dependencies["juhe"]
+
+    assert any(dep.startswith("aiohttp>=") for dep in juhe_extra)
+    assert any(
+        dep == "qwsaas @ git+ssh://git@github.com:22/huang0752/qwsaas.git@v0.1.0"
+        for dep in juhe_extra
+    )
+    assert "hermes-agent[juhe]" not in optional_dependencies["all"]
