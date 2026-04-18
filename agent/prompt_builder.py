@@ -336,7 +336,12 @@ PLATFORM_HINTS = {
     "juhe": (
         "You are communicating through Juhe, an enterprise WeChat bridge. "
         "Use plain text formatting and avoid markdown-specific rendering assumptions. "
-        "In phase 1, Juhe supports text replies only."
+        "Juhe can send file attachments from externally reachable HTTP(S) URLs: "
+        "include MEDIA:https://... in your response when you need to deliver a "
+        "document, image, audio clip, or video. If temporary object storage is "
+        "configured, local MEDIA:/absolute/path files can be staged automatically "
+        "and sent through Juhe as well. Without that staging configuration, "
+        "Juhe's upload API cannot read local filesystem paths directly."
     ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "

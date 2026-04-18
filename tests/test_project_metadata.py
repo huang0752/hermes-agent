@@ -38,6 +38,7 @@ def test_juhe_extra_is_explicit_and_not_in_all():
     juhe_extra = optional_dependencies["juhe"]
 
     assert any(dep.startswith("aiohttp>=") for dep in juhe_extra)
+    assert any(dep.startswith("boto3>=") for dep in juhe_extra)
     assert any(
         dep == "qwsaas @ git+ssh://git@github.com:22/huang0752/qwsaas.git@v0.1.0"
         for dep in juhe_extra

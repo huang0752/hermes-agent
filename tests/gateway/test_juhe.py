@@ -22,6 +22,7 @@ def _make_adapter():
                 "app_key": "app-key",
                 "app_secret": "app-secret",
                 "guid": "guid-123",
+                "private_base_url": "https://private.example/upload",
                 "allow_from": ["1001", "1002"],
             },
         )
@@ -62,6 +63,14 @@ class TestJuheConfig:
                 "JUHE_APP_SECRET": "env-app-secret",
                 "JUHE_GUID": "env-guid",
                 "JUHE_BASE_URL": "https://juhe.example.com/",
+                "JUHE_PRIVATE_BASE_URL": "https://juhe-private.example.com/",
+                "JUHE_S3_ENDPOINT_URL": "https://s3.cn-north-1.qiniucs.com",
+                "JUHE_S3_REGION": "cn-north-1",
+                "JUHE_S3_BUCKET": "temp-filechuan",
+                "JUHE_S3_ACCESS_KEY": "s3-ak",
+                "JUHE_S3_SECRET_KEY": "s3-sk",
+                "JUHE_S3_PREFIX": "juhe-temp",
+                "JUHE_S3_URL_EXPIRES_SECONDS": "1800",
                 "JUHE_WEBSOCKET_URL": "wss://juhe.example.com/ws/juhe",
                 "JUHE_ALLOWED_USERS": "S:1001,S:1002",
                 "JUHE_GROUP_ALLOWED_CHATS": "R:2001,R:2002",
@@ -78,6 +87,14 @@ class TestJuheConfig:
         assert platform_config.extra["app_secret"] == "env-app-secret"
         assert platform_config.extra["guid"] == "env-guid"
         assert platform_config.extra["base_url"] == "https://juhe.example.com"
+        assert platform_config.extra["private_base_url"] == "https://juhe-private.example.com"
+        assert platform_config.extra["temp_s3_endpoint_url"] == "https://s3.cn-north-1.qiniucs.com"
+        assert platform_config.extra["temp_s3_region"] == "cn-north-1"
+        assert platform_config.extra["temp_s3_bucket"] == "temp-filechuan"
+        assert platform_config.extra["temp_s3_access_key"] == "s3-ak"
+        assert platform_config.extra["temp_s3_secret_key"] == "s3-sk"
+        assert platform_config.extra["temp_s3_prefix"] == "juhe-temp"
+        assert platform_config.extra["temp_s3_url_expires_seconds"] == 1800
         assert platform_config.extra["websocket_url"] == "wss://juhe.example.com/ws/juhe"
         assert platform_config.extra["dm_policy"] == "allowlist"
         assert platform_config.extra["allow_from"] == "S:1001,S:1002"
@@ -113,6 +130,14 @@ class TestJuheAdapterInit:
                     "app_key": "cfg-app",
                     "app_secret": "cfg-secret",
                     "guid": "cfg-guid",
+                    "private_base_url": "https://private.example/api",
+                    "temp_s3_endpoint_url": "https://s3.example.com",
+                    "temp_s3_region": "cn-north-1",
+                    "temp_s3_bucket": "temp-filechuan",
+                    "temp_s3_access_key": "s3-ak",
+                    "temp_s3_secret_key": "s3-sk",
+                    "temp_s3_prefix": "juhe-temp",
+                    "temp_s3_url_expires_seconds": 1200,
                     "websocket_url": "wss://custom.example/ws",
                     "group_policy": "allowlist",
                     "group_allow_from": ["R:2001"],
@@ -123,6 +148,14 @@ class TestJuheAdapterInit:
         assert adapter._app_key == "cfg-app"
         assert adapter._app_secret == "cfg-secret"
         assert adapter._guid == "cfg-guid"
+        assert adapter._private_base_url == "https://private.example/api"
+        assert adapter._temp_s3_endpoint_url == "https://s3.example.com"
+        assert adapter._temp_s3_region == "cn-north-1"
+        assert adapter._temp_s3_bucket == "temp-filechuan"
+        assert adapter._temp_s3_access_key == "s3-ak"
+        assert adapter._temp_s3_secret_key == "s3-sk"
+        assert adapter._temp_s3_prefix == "juhe-temp"
+        assert adapter._temp_s3_url_expires_seconds == 1200
         assert adapter._ws_url == "wss://custom.example/ws"
         assert adapter._group_policy == "allowlist"
         assert adapter._group_allow_from == ["R:2001"]
@@ -131,6 +164,12 @@ class TestJuheAdapterInit:
         monkeypatch.setenv("JUHE_APP_KEY", "env-app")
         monkeypatch.setenv("JUHE_APP_SECRET", "env-secret")
         monkeypatch.setenv("JUHE_GUID", "env-guid")
+        monkeypatch.setenv("JUHE_PRIVATE_BASE_URL", "https://env.example/private")
+        monkeypatch.setenv("JUHE_S3_ENDPOINT_URL", "https://s3.env.example.com")
+        monkeypatch.setenv("JUHE_S3_REGION", "cn-north-1")
+        monkeypatch.setenv("JUHE_S3_BUCKET", "temp-filechuan")
+        monkeypatch.setenv("QINIU_ACCESS_KEY", "fallback-ak")
+        monkeypatch.setenv("QINIU_SECRET_KEY", "fallback-sk")
         monkeypatch.setenv("JUHE_WEBSOCKET_URL", "wss://env.example/ws")
         from gateway.platforms.juhe import JuheAdapter
 
@@ -138,6 +177,12 @@ class TestJuheAdapterInit:
         assert adapter._app_key == "env-app"
         assert adapter._app_secret == "env-secret"
         assert adapter._guid == "env-guid"
+        assert adapter._private_base_url == "https://env.example/private"
+        assert adapter._temp_s3_endpoint_url == "https://s3.env.example.com"
+        assert adapter._temp_s3_region == "cn-north-1"
+        assert adapter._temp_s3_bucket == "temp-filechuan"
+        assert adapter._temp_s3_access_key == "fallback-ak"
+        assert adapter._temp_s3_secret_key == "fallback-sk"
         assert adapter._ws_url == "wss://env.example/ws"
 
 
@@ -615,6 +660,106 @@ class TestJuheSend:
         assert result.success is False
         assert "S:" in (result.error or "")
 
+    def test_build_sdk_client_passes_private_base_url(self):
+        adapter = _make_adapter()
+        adapter._private_base_url = "https://private.example/base"
+
+        client = adapter._build_sdk_client()
+
+        assert client.public_base_url == adapter._base_url
+        assert client.private_base_url == "https://private.example/base"
+
+    @pytest.mark.asyncio
+    async def test_send_document_uses_small_file_flow_for_http_url(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        small_upload = AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-file-1"}})
+        big_upload = AsyncMock(return_value={"error_code": 0})
+        monkeypatch.setattr(juhe_module, "send_small_file_from_url", small_upload)
+        monkeypatch.setattr(juhe_module, "send_big_file_from_url", big_upload)
+        monkeypatch.setattr(adapter, "_get_remote_file_size_hint", AsyncMock(return_value=1024))
+
+        result = await adapter.send_document("S:1001", "https://files.example.com/report.pdf")
+
+        assert result.success is True
+        assert result.message_id == "msg-file-1"
+        small_upload.assert_awaited_once_with(
+            client=adapter._get_sdk_client(),
+            conversation_id="S:1001",
+            file_url="https://files.example.com/report.pdf",
+            file_name="report.pdf",
+            file_type=5,
+        )
+        big_upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_image_uses_big_file_flow_when_remote_size_is_large(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        small_upload = AsyncMock(return_value={"error_code": 0})
+        big_upload = AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-file-2"}})
+        monkeypatch.setattr(juhe_module, "send_small_file_from_url", small_upload)
+        monkeypatch.setattr(juhe_module, "send_big_file_from_url", big_upload)
+        monkeypatch.setattr(adapter, "_get_remote_file_size_hint", AsyncMock(return_value=25 * 1024 * 1024))
+
+        result = await adapter.send_image("S:1001", "https://files.example.com/photo.png")
+
+        assert result.success is True
+        assert result.message_id == "msg-file-2"
+        big_upload.assert_awaited_once_with(
+            client=adapter._get_sdk_client(),
+            conversation_id="S:1001",
+            file_url="https://files.example.com/photo.png",
+            file_name="photo.png",
+            file_type=2,
+        )
+        small_upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_stages_local_path_via_temp_s3(self, monkeypatch, tmp_path):
+        adapter = _make_adapter()
+        file_path = tmp_path / "report.txt"
+        file_path.write_text("hello", encoding="utf-8")
+        cleanup = AsyncMock()
+        monkeypatch.setattr(
+            adapter,
+            "_stage_local_file_for_upload",
+            AsyncMock(return_value=("https://temp.example.com/report.txt?sig=1", cleanup)),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_upload_file_from_url",
+            AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-local-1"}}),
+        )
+
+        result = await adapter.send_document("S:1001", str(file_path))
+
+        assert result.success is True
+        assert result.message_id == "msg-local-1"
+        adapter._stage_local_file_for_upload.assert_awaited_once_with(str(file_path))
+        adapter._upload_file_from_url.assert_awaited_once_with(
+            client=adapter._get_sdk_client(),
+            conversation_id="S:1001",
+            file_url="https://temp.example.com/report.txt?sig=1",
+            file_name="report.txt",
+            file_type=5,
+        )
+        cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejects_local_path_without_temp_s3(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._temp_s3_bucket = None
+        file_path = tmp_path / "report.txt"
+        file_path.write_text("hello", encoding="utf-8")
+
+        result = await adapter.send_document("S:1001", str(file_path))
+
+        assert result.success is False
+        assert "JUHE_S3_BUCKET" in (result.error or "")
+
 
 class TestGatewayIntegration:
     def test_platform_enum_value(self):
@@ -700,3 +845,69 @@ class TestSendJuheStandalone:
             "chat_id": "S:1001",
             "message_id": "msg-123",
         }
+
+    @pytest.mark.asyncio
+    async def test_send_juhe_routes_media_via_adapter_methods(self):
+        from tools.send_message_tool import _send_juhe
+
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=True)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-123", error=None))
+        adapter.send_document = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="file-456", error=None)
+        )
+        adapter.disconnect = AsyncMock()
+
+        with patch("gateway.platforms.juhe.check_juhe_requirements", return_value=True), \
+             patch("tools.send_message_tool.JuheAdapter", return_value=adapter):
+            result = await _send_juhe(
+                {"app_key": "app", "app_secret": "secret", "guid": "guid"},
+                "S:1001",
+                "hello juhe",
+                media_files=[("https://files.example.com/report.pdf", False)],
+            )
+
+        assert result == {
+            "success": True,
+            "platform": "juhe",
+            "chat_id": "S:1001",
+            "message_id": "file-456",
+        }
+        adapter.send.assert_awaited_once_with("S:1001", "hello juhe")
+        adapter.send_document.assert_awaited_once_with("S:1001", "https://files.example.com/report.pdf")
+
+    @pytest.mark.asyncio
+    async def test_send_juhe_expands_local_media_home_path(self, monkeypatch, tmp_path):
+        from tools.send_message_tool import _send_juhe
+
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        file_path = home_dir / "report.pdf"
+        file_path.write_bytes(b"%PDF-1.4\n")
+        monkeypatch.setenv("HOME", str(home_dir))
+
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=True)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-123", error=None))
+        adapter.send_document = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="file-789", error=None)
+        )
+        adapter.disconnect = AsyncMock()
+
+        with patch("gateway.platforms.juhe.check_juhe_requirements", return_value=True), \
+             patch("tools.send_message_tool.JuheAdapter", return_value=adapter):
+            result = await _send_juhe(
+                {"app_key": "app", "app_secret": "secret", "guid": "guid"},
+                "S:1001",
+                "",
+                media_files=[("~/report.pdf", False)],
+            )
+
+        assert result == {
+            "success": True,
+            "platform": "juhe",
+            "chat_id": "S:1001",
+            "message_id": "file-789",
+        }
+        adapter.send.assert_not_awaited()
+        adapter.send_document.assert_awaited_once_with("S:1001", str(file_path))

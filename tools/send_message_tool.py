@@ -1,8 +1,9 @@
 """Send Message Tool -- cross-channel messaging via platform APIs.
 
-Sends a message to a user or channel on any connected messaging platform
-(Telegram, Discord, Slack). Supports listing available targets and resolving
-human-friendly channel names to IDs. Works in both CLI and gateway contexts.
+Sends a message to a user or channel on any connected messaging platform.
+Supports listing available targets, resolving human-friendly channel names to
+IDs, and native media delivery on platforms whose adapters expose it. Works in
+both CLI and gateway contexts.
 """
 
 import json
@@ -11,6 +12,7 @@ import os
 import re
 import ssl
 import time
+from urllib.parse import urlparse
 
 from agent.redact import redact_sensitive_text
 
@@ -54,6 +56,18 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _looks_like_http_url(value: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _media_source_extension(value: str) -> str:
+    text = str(value or "").strip()
+    if _looks_like_http_url(text):
+        text = urlparse(text).path
+    return os.path.splitext(text)[1].lower()
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -397,26 +411,40 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Juhe: native URL-backed media delivery via the adapter helper ---
+    if platform == Platform.JUHE:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_juhe(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Weixin: use the native one-shot adapter helper for text + media ---
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
-    if platform == Platform.JUHE and media_files:
-        return {"error": "Juhe send_message currently supports text-only delivery; MEDIA attachments are not supported"}
-
-    # --- Non-Telegram platforms ---
+    # --- Remaining platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram; "
-                f"target {platform.value} had only media attachments"
+                "send_message MEDIA-only delivery is currently supported only for "
+                f"telegram, weixin, and juhe; target {platform.value} had only media attachments"
             )
         }
     warning = None
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram"
+            "native send_message media delivery is currently only supported for telegram, "
+            "weixin, and juhe"
         )
 
     last_result = None
@@ -968,7 +996,7 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
         return _error(f"Weixin send failed: {e}")
 
 
-async def _send_juhe(extra, chat_id, message):
+async def _send_juhe(extra, chat_id, message, media_files=None):
     """Send via Juhe using the adapter's WebSocket + HTTP pipeline."""
     try:
         from gateway.platforms.juhe import check_juhe_requirements as _runtime_check_juhe_requirements
@@ -980,6 +1008,8 @@ async def _send_juhe(extra, chat_id, message):
     if JuheAdapter is None:
         return {"error": "Juhe adapter not available."}
 
+    media_files = media_files or []
+
     try:
         from gateway.config import PlatformConfig
 
@@ -989,10 +1019,43 @@ async def _send_juhe(extra, chat_id, message):
         if not connected:
             return _error(f"Juhe: failed to connect - {adapter.fatal_error_message or 'unknown error'}")
         try:
-            result = await adapter.send(chat_id, message)
-            if not result.success:
-                return _error(f"Juhe send failed: {result.error}")
-            return {"success": True, "platform": "juhe", "chat_id": chat_id, "message_id": result.message_id}
+            last_result = None
+            if message.strip():
+                last_result = await adapter.send(chat_id, message)
+                if not last_result.success:
+                    return _error(f"Juhe send failed: {last_result.error}")
+
+            for media_path, is_voice in media_files:
+                normalized_media_path = media_path
+                if not _looks_like_http_url(media_path):
+                    normalized_media_path = os.path.expanduser(media_path)
+                    if not os.path.exists(normalized_media_path):
+                        return _error(f"Media file not found: {media_path}")
+
+                ext = _media_source_extension(normalized_media_path)
+                if ext in _IMAGE_EXTS:
+                    last_result = await adapter.send_image_file(chat_id, normalized_media_path)
+                elif ext in _VIDEO_EXTS:
+                    last_result = await adapter.send_video(chat_id, normalized_media_path)
+                elif ext in _VOICE_EXTS and is_voice:
+                    last_result = await adapter.send_voice(chat_id, normalized_media_path)
+                elif ext in _AUDIO_EXTS:
+                    last_result = await adapter.send_voice(chat_id, normalized_media_path)
+                else:
+                    last_result = await adapter.send_document(chat_id, normalized_media_path)
+
+                if not last_result.success:
+                    return _error(f"Juhe media send failed: {last_result.error}")
+
+            if last_result is None:
+                return {"error": "No deliverable text or media remained after processing MEDIA tags"}
+
+            return {
+                "success": True,
+                "platform": "juhe",
+                "chat_id": chat_id,
+                "message_id": last_result.message_id,
+            }
         finally:
             await adapter.disconnect()
     except Exception as e:

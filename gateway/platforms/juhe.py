@@ -1,8 +1,8 @@
 """Juhe platform adapter.
 
 Connects Hermes Agent to enterprise WeChat conversations through the juhebot
-aggregate-chat gateway.  Phase 1 intentionally supports only one account,
-WeWork/enterprise WeChat, WebSocket callbacks, and text messages.
+aggregate-chat gateway. Supports one account, WebSocket callbacks, text
+messages, and file delivery from externally reachable HTTP(S) URLs.
 """
 
 from __future__ import annotations
@@ -10,9 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
+import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 try:
     import aiohttp
@@ -31,7 +35,7 @@ except ImportError:  # pragma: no cover - dependency gate
     HTTPX_AVAILABLE = False
 
 try:
-    from qwsaas import JuheWsClient, QwSaasClient
+    from qwsaas import JuheWsClient, QwSaasClient, send_big_file_from_url, send_small_file_from_url
     from qwsaas.callbacks import (
         NOTIFY_BATCH_NEW_MESSAGE,
         NOTIFY_NEW_MESSAGE,
@@ -39,13 +43,17 @@ try:
         parse_callback_envelope,
         parse_callback_event,
     )
+    from qwsaas.exceptions import QwSaasError
 
     QWSAAS_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency gate
     JuheWsClient = None  # type: ignore[assignment]
     QwSaasClient = None  # type: ignore[assignment]
+    send_big_file_from_url = None  # type: ignore[assignment]
+    send_small_file_from_url = None  # type: ignore[assignment]
     parse_callback_envelope = None  # type: ignore[assignment]
     parse_callback_event = None  # type: ignore[assignment]
+    QwSaasError = Exception  # type: ignore[assignment]
     QWSAAS_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
@@ -102,6 +110,9 @@ MSG_TYPE_LABELS = {
 DEDUP_TTL_SECONDS = 30 * 60
 DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF_SECONDS = [2, 5, 10, 30, 60]
+SMALL_FILE_LIMIT_BYTES = 20 * 1024 * 1024
+DEFAULT_TEMP_S3_URL_EXPIRES_SECONDS = 3600
+DEFAULT_TEMP_S3_PREFIX = "juhe-temp"
 
 
 def check_juhe_requirements() -> bool:
@@ -176,6 +187,22 @@ def _normalize_group(value: str) -> str:
     return _strip_target_prefix(value).lower()
 
 
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _source_name(value: str, default: str = "attachment") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    if _is_http_url(text):
+        path = unquote(urlparse(text).path or "")
+        name = Path(path).name
+        return name or default
+    return Path(text).name or default
+
+
 def _prefixed_dm(value: str) -> str:
     text = str(value or "").strip()
     return text if text.upper().startswith("S:") else f"S:{text}"
@@ -210,6 +237,44 @@ class JuheAdapter(BasePlatformAdapter):
         self._base_url = str(
             extra.get("base_url") or os.getenv("JUHE_BASE_URL", DEFAULT_BASE_URL)
         ).strip().rstrip("/") or DEFAULT_BASE_URL
+        self._private_base_url = (
+            str(extra.get("private_base_url") or os.getenv("JUHE_PRIVATE_BASE_URL", "")).strip().rstrip("/")
+            or None
+        )
+        self._temp_s3_endpoint_url = (
+            str(extra.get("temp_s3_endpoint_url") or os.getenv("JUHE_S3_ENDPOINT_URL", "")).strip().rstrip("/")
+            or None
+        )
+        self._temp_s3_region = str(
+            extra.get("temp_s3_region") or os.getenv("JUHE_S3_REGION", "")
+        ).strip() or None
+        self._temp_s3_bucket = str(
+            extra.get("temp_s3_bucket") or os.getenv("JUHE_S3_BUCKET", "")
+        ).strip() or None
+        self._temp_s3_access_key = str(
+            extra.get("temp_s3_access_key")
+            or os.getenv("JUHE_S3_ACCESS_KEY")
+            or os.getenv("QINIU_ACCESS_KEY", "")
+        ).strip() or None
+        self._temp_s3_secret_key = str(
+            extra.get("temp_s3_secret_key")
+            or os.getenv("JUHE_S3_SECRET_KEY")
+            or os.getenv("QINIU_SECRET_KEY", "")
+        ).strip() or None
+        self._temp_s3_prefix = str(
+            extra.get("temp_s3_prefix") or os.getenv("JUHE_S3_PREFIX", DEFAULT_TEMP_S3_PREFIX)
+        ).strip().strip("/") or DEFAULT_TEMP_S3_PREFIX
+        self._temp_s3_addressing_style = str(
+            extra.get("temp_s3_addressing_style") or os.getenv("JUHE_S3_ADDRESSING_STYLE", "virtual")
+        ).strip().lower() or "virtual"
+        temp_s3_expires_raw = extra.get(
+            "temp_s3_url_expires_seconds",
+            os.getenv("JUHE_S3_URL_EXPIRES_SECONDS", str(DEFAULT_TEMP_S3_URL_EXPIRES_SECONDS)),
+        )
+        try:
+            self._temp_s3_url_expires_seconds = max(60, int(temp_s3_expires_raw))
+        except (TypeError, ValueError):
+            self._temp_s3_url_expires_seconds = DEFAULT_TEMP_S3_URL_EXPIRES_SECONDS
         self._ws_url = str(
             extra.get("websocket_url")
             or extra.get("ws_url")
@@ -582,6 +647,305 @@ class JuheAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(result.get("err_msg") or err_code))
         return SendResult(success=True, message_id=str(result.get("message_id") or ""))
 
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        return await self._send_file_from_source(
+            chat_id=chat_id,
+            source=image_url,
+            file_type=2,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file_from_source(
+            chat_id=chat_id,
+            source=image_path,
+            file_type=2,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file_from_source(
+            chat_id=chat_id,
+            source=video_path,
+            file_type=4,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file_from_source(
+            chat_id=chat_id,
+            source=audio_path,
+            file_type=5,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file_from_source(
+            chat_id=chat_id,
+            source=file_path,
+            file_type=5,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
+            file_name=file_name,
+        )
+
+    async def _send_file_from_source(
+        self,
+        *,
+        chat_id: str,
+        source: str,
+        file_type: int,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        target = str(chat_id or "").strip()
+        if not target.upper().startswith(("S:", "R:")):
+            return SendResult(success=False, error="Juhe targets must be prefixed with S: for DMs or R: for groups")
+
+        source_text = str(source or "").strip()
+        if not source_text:
+            return SendResult(success=False, error="Juhe file source is required")
+        if not self._private_base_url:
+            return SendResult(success=False, error="JUHE_PRIVATE_BASE_URL is required for Juhe file delivery")
+
+        if caption:
+            caption_result = await self.send(target, caption, reply_to=reply_to, metadata=metadata)
+            if not caption_result.success:
+                return caption_result
+
+        staged_cleanup = None
+        try:
+            upload_source, staged_cleanup = await self._resolve_upload_source(source_text)
+        except FileNotFoundError as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+        upload_name = file_name or _source_name(source_text)
+        try:
+            client = self._get_sdk_client()
+            body = await self._upload_file_from_url(
+                client=client,
+                conversation_id=target,
+                file_url=upload_source,
+                file_name=upload_name,
+                file_type=file_type,
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+        finally:
+            if staged_cleanup is not None:
+                try:
+                    await staged_cleanup()
+                except Exception:
+                    logger.warning("[%s] Failed to clean up staged temp object for %s", self.name, source_text, exc_info=True)
+
+        response_data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        return SendResult(
+            success=True,
+            message_id=str(body.get("message_id") or response_data.get("message_id") or ""),
+        )
+
+    async def _resolve_upload_source(
+        self,
+        source: str,
+    ) -> Tuple[str, Optional[Callable[[], Awaitable[None]]]]:
+        if _is_http_url(source):
+            return source, None
+
+        path = Path(source).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"Media file not found: {source}")
+
+        return await self._stage_local_file_for_upload(str(path))
+
+    async def _stage_local_file_for_upload(
+        self,
+        file_path: str,
+    ) -> Tuple[str, Callable[[], Awaitable[None]]]:
+        missing = self._missing_temp_s3_fields()
+        if missing:
+            raise RuntimeError(
+                "Juhe local file delivery requires temporary S3 staging. Missing: "
+                + ", ".join(missing)
+            )
+
+        object_key = self._build_temp_s3_object_key(Path(file_path))
+        file_url = await asyncio.to_thread(self._upload_local_file_to_temp_s3_sync, file_path, object_key)
+
+        async def _cleanup() -> None:
+            await asyncio.to_thread(self._delete_temp_s3_object_sync, object_key)
+
+        return file_url, _cleanup
+
+    def _missing_temp_s3_fields(self) -> List[str]:
+        missing = []
+        if not self._temp_s3_endpoint_url:
+            missing.append("JUHE_S3_ENDPOINT_URL")
+        if not self._temp_s3_bucket:
+            missing.append("JUHE_S3_BUCKET")
+        if not self._temp_s3_access_key:
+            missing.append("JUHE_S3_ACCESS_KEY (or QINIU_ACCESS_KEY)")
+        if not self._temp_s3_secret_key:
+            missing.append("JUHE_S3_SECRET_KEY (or QINIU_SECRET_KEY)")
+        return missing
+
+    def _build_temp_s3_object_key(self, file_path: Path) -> str:
+        suffix = file_path.suffix.lower()
+        date_prefix = datetime.now().strftime("%Y/%m/%d")
+        token = uuid.uuid4().hex
+        return "/".join(part for part in [self._temp_s3_prefix, date_prefix, f"{token}{suffix}"] if part)
+
+    def _build_temp_s3_client(self) -> Any:
+        try:
+            import boto3
+            from botocore.config import Config as BotoConfig
+        except ImportError as exc:  # pragma: no cover - exercised by runtime only
+            raise RuntimeError(
+                "boto3 is required for Juhe local file staging. Install hermes-agent[juhe] or pip install boto3."
+            ) from exc
+
+        return boto3.client(
+            "s3",
+            endpoint_url=self._temp_s3_endpoint_url,
+            aws_access_key_id=self._temp_s3_access_key,
+            aws_secret_access_key=self._temp_s3_secret_key,
+            region_name=self._temp_s3_region,
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": self._temp_s3_addressing_style},
+            ),
+        )
+
+    def _upload_local_file_to_temp_s3_sync(self, file_path: str, object_key: str) -> str:
+        client = self._build_temp_s3_client()
+        content_type, _encoding = mimetypes.guess_type(file_path)
+        extra_args = {"ContentType": content_type} if content_type else None
+        if extra_args:
+            client.upload_file(file_path, self._temp_s3_bucket, object_key, ExtraArgs=extra_args)
+        else:
+            client.upload_file(file_path, self._temp_s3_bucket, object_key)
+
+        return client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self._temp_s3_bucket, "Key": object_key},
+            ExpiresIn=self._temp_s3_url_expires_seconds,
+        )
+
+    def _delete_temp_s3_object_sync(self, object_key: str) -> None:
+        try:
+            client = self._build_temp_s3_client()
+            client.delete_object(Bucket=self._temp_s3_bucket, Key=object_key)
+        except Exception:
+            logger.warning("[%s] Failed to delete staged temp object %s", self.name, object_key, exc_info=True)
+
+    async def _upload_file_from_url(
+        self,
+        *,
+        client: "QwSaasClient",
+        conversation_id: str,
+        file_url: str,
+        file_name: str,
+        file_type: int,
+    ) -> Dict[str, Any]:
+        size_hint = await self._get_remote_file_size_hint(file_url)
+        if size_hint is not None and size_hint > SMALL_FILE_LIMIT_BYTES:
+            return await send_big_file_from_url(
+                client=client,
+                conversation_id=conversation_id,
+                file_url=file_url,
+                file_name=file_name,
+                file_type=file_type,
+            )
+
+        try:
+            return await send_small_file_from_url(
+                client=client,
+                conversation_id=conversation_id,
+                file_url=file_url,
+                file_name=file_name,
+                file_type=file_type,
+            )
+        except QwSaasError:
+            if size_hint is None:
+                logger.info("[%s] small upload failed for %s, retrying big upload", self.name, file_url)
+                return await send_big_file_from_url(
+                    client=client,
+                    conversation_id=conversation_id,
+                    file_url=file_url,
+                    file_name=file_name,
+                    file_type=file_type,
+                )
+            raise
+
+    async def _get_remote_file_size_hint(self, file_url: str) -> Optional[int]:
+        if not _is_http_url(file_url):
+            return None
+        if not HTTPX_AVAILABLE:
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.head(file_url)
+                content_length = response.headers.get("Content-Length")
+                if response.status_code < 400 and content_length:
+                    return int(content_length)
+
+                async with client.stream("GET", file_url, headers={"Range": "bytes=0-0"}) as stream:
+                    content_length = stream.headers.get("Content-Length")
+                    if stream.status_code < 400 and content_length:
+                        return int(content_length)
+        except Exception:
+            logger.debug("[%s] Failed to determine remote file size for %s", self.name, file_url, exc_info=True)
+        return None
+
     async def _guid_request(self, *, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         client = self._get_sdk_client()
         request_data = dict(data)
@@ -604,6 +968,7 @@ class JuheAdapter(BasePlatformAdapter):
             app_key=self._app_key,
             app_secret=self._app_secret,
             guid=self._guid,
+            private_base_url=self._private_base_url,
             public_base_url=self._base_url,
         )
 

@@ -1,5 +1,12 @@
 import asyncio
 import os
+import sys
+import threading
+import types
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -230,3 +237,96 @@ def test_session_key_no_race_condition_with_contextvars(monkeypatch):
     assert results["session-B"] == "session-B", (
         f"Session B got '{results['session-B']}' instead of 'session-B' — race condition!"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_session_contextvars_in_executor(monkeypatch, tmp_path):
+    """Gateway _run_agent must carry session contextvars into its worker thread."""
+
+    class _CapturingAgent:
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            del message, conversation_history, task_id
+            return {
+                "final_response": (
+                    f"{get_session_env('HERMES_SESSION_PLATFORM')}"
+                    f"|{get_session_env('HERMES_SESSION_CHAT_ID')}"
+                ),
+                "messages": [],
+                "api_calls": 1,
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._ephemeral_system_prompt = ""
+    runner._prefill_messages = []
+    runner._reasoning_config = None
+    runner._service_tier = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._smart_model_routing = {}
+    runner._running_agents = {}
+    runner._pending_model_notes = {}
+    runner._session_db = None
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_model_overrides = {}
+    runner._voice_mode = {}
+    runner._draining = False
+    runner.hooks = SimpleNamespace(loaded_hooks=False, emit=AsyncMock())
+    runner.config = SimpleNamespace(streaming=None)
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
+        load_transcript=lambda session_id: [],
+    )
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner._update_runtime_status = lambda *args, **kwargs: None
+    runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    monkeypatch.setattr("gateway.run._env_path", tmp_path / ".env")
+    monkeypatch.setattr("gateway.run.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: {"core"},
+    )
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+
+    source = SessionSource(
+        platform=Platform.JUHE,
+        chat_id="S:7881300558115752",
+        chat_type="dm",
+        user_id="u1",
+    )
+
+    tokens = set_session_vars(platform="juhe", chat_id="S:7881300558115752")
+    try:
+        result = await runner._run_agent(
+            message="10 分钟后叫我打水",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key="agent:main:juhe:dm:S:7881300558115752",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["final_response"] == "juhe|S:7881300558115752"

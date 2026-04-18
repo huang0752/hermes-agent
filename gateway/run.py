@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -85,6 +86,12 @@ from dotenv import load_dotenv  # backward-compat for tests that monkeypatch thi
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+
+
+def _run_in_executor_with_context(loop: asyncio.AbstractEventLoop, fn, *args):
+    """Submit work to the default executor while preserving ContextVars."""
+    ctx = contextvars.copy_context()
+    return loop.run_in_executor(None, lambda: ctx.run(fn, *args))
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -5698,7 +5705,7 @@ class GatewayRunner:
                 )
 
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, run_sync)
+            result = await _run_in_executor_with_context(loop, run_sync)
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -5881,7 +5888,7 @@ class GatewayRunner:
                 )
 
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, run_sync)
+            result = await _run_in_executor_with_context(loop, run_sync)
 
             response = (result.get("final_response") or "") if result else ""
             if not response and result and result.get("error"):
@@ -8975,7 +8982,7 @@ class GatewayRunner:
             _warning_fired = False
             loop = asyncio.get_event_loop()
             _executor_task = asyncio.ensure_future(
-                loop.run_in_executor(None, run_sync)
+                _run_in_executor_with_context(loop, run_sync)
             )
 
             _inactivity_timeout = False

@@ -1081,6 +1081,36 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         juhe_base_url = os.getenv("JUHE_BASE_URL", "").strip()
         if juhe_base_url:
             config.platforms[Platform.JUHE].extra["base_url"] = juhe_base_url.rstrip("/")
+        juhe_private_base_url = os.getenv("JUHE_PRIVATE_BASE_URL", "").strip()
+        if juhe_private_base_url:
+            config.platforms[Platform.JUHE].extra["private_base_url"] = juhe_private_base_url.rstrip("/")
+        juhe_s3_endpoint_url = os.getenv("JUHE_S3_ENDPOINT_URL", "").strip()
+        if juhe_s3_endpoint_url:
+            config.platforms[Platform.JUHE].extra["temp_s3_endpoint_url"] = juhe_s3_endpoint_url.rstrip("/")
+        juhe_s3_region = os.getenv("JUHE_S3_REGION", "").strip()
+        if juhe_s3_region:
+            config.platforms[Platform.JUHE].extra["temp_s3_region"] = juhe_s3_region
+        juhe_s3_bucket = os.getenv("JUHE_S3_BUCKET", "").strip()
+        if juhe_s3_bucket:
+            config.platforms[Platform.JUHE].extra["temp_s3_bucket"] = juhe_s3_bucket
+        juhe_s3_access_key = os.getenv("JUHE_S3_ACCESS_KEY", "").strip()
+        if juhe_s3_access_key:
+            config.platforms[Platform.JUHE].extra["temp_s3_access_key"] = juhe_s3_access_key
+        juhe_s3_secret_key = os.getenv("JUHE_S3_SECRET_KEY", "").strip()
+        if juhe_s3_secret_key:
+            config.platforms[Platform.JUHE].extra["temp_s3_secret_key"] = juhe_s3_secret_key
+        juhe_s3_prefix = os.getenv("JUHE_S3_PREFIX", "").strip().strip("/")
+        if juhe_s3_prefix:
+            config.platforms[Platform.JUHE].extra["temp_s3_prefix"] = juhe_s3_prefix
+        juhe_s3_expires = os.getenv("JUHE_S3_URL_EXPIRES_SECONDS", "").strip()
+        if juhe_s3_expires:
+            try:
+                config.platforms[Platform.JUHE].extra["temp_s3_url_expires_seconds"] = int(juhe_s3_expires)
+            except ValueError:
+                pass
+        juhe_s3_addressing_style = os.getenv("JUHE_S3_ADDRESSING_STYLE", "").strip()
+        if juhe_s3_addressing_style:
+            config.platforms[Platform.JUHE].extra["temp_s3_addressing_style"] = juhe_s3_addressing_style
         juhe_ws_url = os.getenv("JUHE_WEBSOCKET_URL", "").strip()
         if juhe_ws_url:
             config.platforms[Platform.JUHE].extra["websocket_url"] = juhe_ws_url.rstrip("/")

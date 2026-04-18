@@ -333,6 +333,29 @@ class TestSendMessageTool:
         assert leaked not in result["error"]
         assert "access_token=***" in result["error"]
 
+    def test_juhe_media_only_message_routes_through_juhe_helper(self):
+        pconfig = SimpleNamespace(enabled=True, extra={"app_key": "app", "app_secret": "secret", "guid": "guid"})
+        send = AsyncMock(return_value={"success": True, "message_id": "m1"})
+
+        with patch("tools.send_message_tool._send_juhe", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.JUHE,
+                    pconfig,
+                    "S:1001",
+                    "",
+                    media_files=[("https://files.example.com/report.pdf", False)],
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            pconfig.extra,
+            "S:1001",
+            "",
+            media_files=[("https://files.example.com/report.pdf", False)],
+        )
+
 
 class TestSendTelegramMediaDelivery:
     def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):

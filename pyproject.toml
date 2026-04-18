@@ -43,6 +43,7 @@ dev = ["debugpy>=1.8.0,<2", "pytest>=9.0.2,<10", "pytest-asyncio>=1.3.0,<2", "py
 messaging = ["python-telegram-bot[webhooks]>=22.6,<23", "discord.py[voice]>=2.7.1,<3", "aiohttp>=3.13.3,<4", "slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4"]
 juhe = [
   "aiohttp>=3.13.3,<4",
+  "boto3>=1.40.0,<2",
   "qwsaas @ git+ssh://git@github.com:22/huang0752/qwsaas.git@v0.1.0",
 ]
 cron = ["croniter>=6.0.0,<7"]

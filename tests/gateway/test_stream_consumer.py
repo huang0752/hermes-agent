@@ -41,6 +41,12 @@ class TestCleanForDisplay:
             result = GatewayStreamConsumer._clean_for_display(text)
             assert "MEDIA:" not in result, f"Failed for wrapper: {wrapper}"
 
+    def test_media_tag_with_unquoted_document_path_and_spaces(self):
+        """Document MEDIA: tags with spaces should not leak filename text."""
+        text = "MEDIA:/Users/chou/Desktop/藤毅专利/模板 (空白).docx"
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert result.strip() == ""
+
     def test_audio_as_voice_stripped(self):
         """[[audio_as_voice]] directive is removed."""
         text = "[[audio_as_voice]]\nMEDIA:/tmp/voice.ogg"

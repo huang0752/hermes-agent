@@ -1482,6 +1482,48 @@ class TestConcurrentToolExecution:
         assert {entry[0] for entry in completes} == {"c1", "c2"}
         assert {entry[3] for entry in completes} == {'{"id":1}', '{"id":2}'}
 
+    def test_concurrent_tools_preserve_session_contextvars(self, agent, monkeypatch):
+        """Concurrent tool workers must see the gateway session context."""
+        tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1])
+        messages = []
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+
+        def _capture_session(*args, **kwargs):
+            del args, kwargs
+            from gateway.session_context import get_session_env
+
+            return json.dumps(
+                {
+                    "platform": get_session_env("HERMES_SESSION_PLATFORM"),
+                    "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
+                    "thread_id": get_session_env("HERMES_SESSION_THREAD_ID"),
+                }
+            )
+
+        tokens = set_session_vars(
+            platform="juhe",
+            chat_id="S:7881300558115752",
+            thread_id="topic-1",
+        )
+        try:
+            with patch("run_agent.handle_function_call", side_effect=_capture_session):
+                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+        finally:
+            clear_session_vars(tokens)
+
+        assert len(messages) == 1
+        assert json.loads(messages[0]["content"]) == {
+            "platform": "juhe",
+            "chat_id": "S:7881300558115752",
+            "thread_id": "topic-1",
+        }
+
     def test_invoke_tool_handles_agent_level_tools(self, agent):
         """_invoke_tool should handle todo tool directly."""
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:

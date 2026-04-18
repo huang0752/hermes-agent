@@ -23,6 +23,7 @@ Usage:
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import json
@@ -7136,6 +7137,10 @@ class AIAgent:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error)
 
+        def _run_tool_with_context(ctx, index, tool_call, function_name, function_args):
+            """Worker wrapper that preserves gateway/session ContextVars."""
+            ctx.run(_run_tool, index, tool_call, function_name, function_args)
+
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
         if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
@@ -7148,7 +7153,8 @@ class AIAgent:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                    tool_ctx = contextvars.copy_context()
+                    f = executor.submit(_run_tool_with_context, tool_ctx, i, tc, name, args)
                     futures.append(f)
 
                 # Wait for all to complete (exceptions are captured inside _run_tool)

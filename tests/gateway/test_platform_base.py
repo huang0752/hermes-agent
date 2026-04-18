@@ -321,6 +321,12 @@ class TestExtractMedia:
         assert "Here" in cleaned
         assert "After" in cleaned
 
+    def test_media_tag_supports_unquoted_document_paths_with_spaces(self):
+        content = "MEDIA:/Users/chou/Desktop/藤毅专利/模板 (空白).docx"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/Users/chou/Desktop/藤毅专利/模板 (空白).docx", False)]
+        assert cleaned == ""
+
 
 # ---------------------------------------------------------------------------
 # truncate_message
@@ -581,4 +587,3 @@ class TestTruncateMessageUtf16:
             assert fence_count % 2 == 0, (
                 f"Chunk {i} has unbalanced fences ({fence_count})"
             )
-

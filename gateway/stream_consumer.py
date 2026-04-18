@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES
+
 logger = logging.getLogger("gateway.stream_consumer")
 
 # Sentinel to signal the stream is complete
@@ -419,10 +421,22 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
 
-    # Pattern to strip MEDIA:<path> tags (including optional surrounding quotes).
-    # Matches the simple cleanup regex used by the non-streaming path in
-    # gateway/platforms/base.py for post-processing.
-    _MEDIA_RE = re.compile(r'''[`"']?MEDIA:\s*\S+[`"']?''')
+    # Pattern to strip MEDIA:<path> tags (including optional surrounding
+    # quotes). Keep this aligned with BasePlatformAdapter.extract_media() so
+    # streaming display does not leak document filenames that will be sent as
+    # native attachments after the stream finishes.
+    _MEDIA_TAG_EXTS = (
+        ".png", ".jpg", ".jpeg", ".gif", ".webp",
+        ".mp4", ".mov", ".avi", ".mkv", ".webm",
+        ".ogg", ".opus", ".mp3", ".wav", ".m4a",
+        *SUPPORTED_DOCUMENT_TYPES.keys(),
+    )
+    _MEDIA_EXT_PART = "|".join(re.escape(ext.lstrip(".")) for ext in _MEDIA_TAG_EXTS)
+    _MEDIA_RE = re.compile(
+        r'''[`"']?MEDIA:\s*(?:`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:'''
+        + _MEDIA_EXT_PART
+        + r''')(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+    )
 
     @staticmethod
     def _clean_for_display(text: str) -> str:

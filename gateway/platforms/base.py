@@ -1212,8 +1212,17 @@ class BasePlatformAdapter(ABC):
         
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
+        media_tag_exts = (
+            ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            ".mp4", ".mov", ".avi", ".mkv", ".webm",
+            ".ogg", ".opus", ".mp3", ".wav", ".m4a",
+            *SUPPORTED_DOCUMENT_TYPES.keys(),
+        )
+        ext_part = "|".join(re.escape(ext.lstrip(".")) for ext in media_tag_exts)
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:'''
+            + ext_part
+            + r''')(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()

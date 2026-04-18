@@ -173,6 +173,25 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_origin_delivery_falls_back_to_juhe_home_channel(self, monkeypatch):
+        monkeypatch.setenv("JUHE_HOME_CHANNEL", "S:7881300558115752")
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("DISCORD_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("SLACK_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("MATRIX_HOME_CHANNEL", raising=False)
+        monkeypatch.delenv("BLUEBUBBLES_HOME_CHANNEL", raising=False)
+
+        job = {
+            "name": "drink-water",
+            "deliver": "origin",
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "juhe",
+            "chat_id": "S:7881300558115752",
+            "thread_id": None,
+        }
+
     def test_explicit_discord_topic_target_with_thread_id(self):
         """deliver: 'discord:chat_id:thread_id' parses correctly."""
         job = {
