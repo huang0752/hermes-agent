@@ -1738,6 +1738,11 @@ class JuheAdapter(BasePlatformAdapter):
                     return int(content_length)
 
                 async with client.stream("GET", file_url, headers={"Range": "bytes=0-0"}) as stream:
+                    content_range = stream.headers.get("Content-Range", "")
+                    if stream.status_code == 206 and "/" in content_range:
+                        total_size = content_range.rsplit("/", 1)[-1].strip()
+                        if total_size.isdigit():
+                            return int(total_size)
                     content_length = stream.headers.get("Content-Length")
                     if stream.status_code < 400 and content_length:
                         return int(content_length)

@@ -1218,6 +1218,49 @@ class TestJuheSend:
         assert client.private_base_url == "https://private.example/base"
 
     @pytest.mark.asyncio
+    async def test_get_remote_file_size_hint_uses_content_range_total_when_head_is_forbidden(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+
+        class _FakeStreamResponse:
+            status_code = 206
+            headers = {
+                "Content-Length": "1",
+                "Content-Range": "bytes 0-0/33123874",
+            }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def head(self, url):
+                return SimpleNamespace(status_code=403, headers={"Content-Length": "263"})
+
+            def stream(self, method, url, headers=None):
+                assert method == "GET"
+                assert headers == {"Range": "bytes=0-0"}
+                return _FakeStreamResponse()
+
+        monkeypatch.setattr(juhe_module.httpx, "AsyncClient", _FakeAsyncClient)
+
+        size_hint = await adapter._get_remote_file_size_hint("https://files.example.com/big.zip")
+
+        assert size_hint == 33123874
+
+    @pytest.mark.asyncio
     async def test_send_document_uses_small_file_flow_for_http_url(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
