@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+from gateway.juhe_cache import JuheCacheStore
 from gateway.channel_directory import (
     build_channel_directory,
     resolve_channel_name,
@@ -285,3 +286,17 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server1):" in result
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
+
+
+class TestJuheDirectory:
+    def test_build_channel_directory_uses_juhe_cache(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            store = JuheCacheStore()
+            store.upsert_contact({"user_id": "1001", "name": "Alice"})
+            store.upsert_room({"room_id": "2001", "roomname": "Dev Group"})
+
+            directory = build_channel_directory({})
+
+        juhe_entries = directory["platforms"]["juhe"]
+        assert {"id": "S:1001", "name": "Alice", "type": "dm"} in juhe_entries
+        assert {"id": "R:2001", "name": "Dev Group", "type": "group"} in juhe_entries

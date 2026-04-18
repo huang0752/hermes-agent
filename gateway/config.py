@@ -45,6 +45,26 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     return default
 
 
+def _first_non_empty_text(*values: Any) -> Optional[str]:
+    """Return the first non-empty string-like value."""
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _normalize_endpoint_url(value: Any, *, use_https: bool = True) -> Optional[str]:
+    """Normalize a host:port or URL into a full endpoint URL."""
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return None
+    if "://" in text:
+        return text
+    scheme = "https" if use_https else "http"
+    return f"{scheme}://{text}"
+
+
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
@@ -1111,6 +1131,48 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         juhe_s3_addressing_style = os.getenv("JUHE_S3_ADDRESSING_STYLE", "").strip()
         if juhe_s3_addressing_style:
             config.platforms[Platform.JUHE].extra["temp_s3_addressing_style"] = juhe_s3_addressing_style
+        juhe_inbound_use_https_value = _first_non_empty_text(
+            os.getenv("JUHE_INBOUND_S3_USE_HTTPS", ""),
+            os.getenv("MINIO_USE_HTTPS", ""),
+        )
+        juhe_inbound_use_https = _coerce_bool(juhe_inbound_use_https_value, default=True)
+        juhe_inbound_endpoint_url = _normalize_endpoint_url(
+            _first_non_empty_text(
+                os.getenv("JUHE_INBOUND_S3_ENDPOINT_URL", ""),
+                os.getenv("MINIO_ENDPOINT", ""),
+            ),
+            use_https=juhe_inbound_use_https,
+        )
+        if juhe_inbound_endpoint_url:
+            config.platforms[Platform.JUHE].extra["inbound_s3_endpoint_url"] = juhe_inbound_endpoint_url
+            config.platforms[Platform.JUHE].extra["inbound_s3_use_https"] = juhe_inbound_use_https
+        juhe_inbound_region = _first_non_empty_text(
+            os.getenv("JUHE_INBOUND_S3_REGION", ""),
+            os.getenv("MINIO_REGION", ""),
+        )
+        if juhe_inbound_region:
+            config.platforms[Platform.JUHE].extra["inbound_s3_region"] = juhe_inbound_region
+        juhe_inbound_bucket = _first_non_empty_text(
+            os.getenv("JUHE_INBOUND_S3_BUCKET", ""),
+            os.getenv("MINIO_DEFAULT_BUCKET", ""),
+        )
+        if juhe_inbound_bucket:
+            config.platforms[Platform.JUHE].extra["inbound_s3_bucket"] = juhe_inbound_bucket
+        juhe_inbound_access_key = _first_non_empty_text(
+            os.getenv("JUHE_INBOUND_S3_ACCESS_KEY", ""),
+            os.getenv("MINIO_ACCESS_KEY", ""),
+        )
+        if juhe_inbound_access_key:
+            config.platforms[Platform.JUHE].extra["inbound_s3_access_key"] = juhe_inbound_access_key
+        juhe_inbound_secret_key = _first_non_empty_text(
+            os.getenv("JUHE_INBOUND_S3_SECRET_KEY", ""),
+            os.getenv("MINIO_SECRET_KEY", ""),
+        )
+        if juhe_inbound_secret_key:
+            config.platforms[Platform.JUHE].extra["inbound_s3_secret_key"] = juhe_inbound_secret_key
+        juhe_inbound_addressing_style = os.getenv("JUHE_INBOUND_S3_ADDRESSING_STYLE", "").strip().lower()
+        if juhe_inbound_addressing_style:
+            config.platforms[Platform.JUHE].extra["inbound_s3_addressing_style"] = juhe_inbound_addressing_style
         juhe_ws_url = os.getenv("JUHE_WEBSOCKET_URL", "").strip()
         if juhe_ws_url:
             config.platforms[Platform.JUHE].extra["websocket_url"] = juhe_ws_url.rstrip("/")

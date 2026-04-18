@@ -1,0 +1,79 @@
+# Hermes runtime config example
+# Copy this file to ~/.hermes/config.yaml for a Juhe/qwsaas deployment.
+# Sensitive values are expected in .env and referenced here with ${ENV_VAR}.
+# Hermes expands those placeholders when loading config.yaml.
+#
+# For the full all-platform template, see cli-config.yaml.example.
+
+model:
+  default: qwen3.6-plus
+  provider: alibaba
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+terminal:
+  backend: local
+  cwd: .
+  timeout: 180
+
+auxiliary:
+  vision:
+    provider: auto
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 120
+    download_timeout: 30
+
+stt:
+  enabled: false
+
+group_sessions_per_user: true
+thread_sessions_per_user: false
+
+platforms:
+  juhe:
+    enabled: true
+    home_channel:
+      platform: juhe
+      chat_id: "S:REPLACE_WITH_HOME_CHANNEL"
+      name: "Home"
+    extra:
+      # Required Juhe/qwsaas credentials.
+      app_key: "${JUHE_APP_KEY}"
+      app_secret: "${JUHE_APP_SECRET}"
+      guid: "${JUHE_GUID}"
+
+      # Optional API endpoints.
+      base_url: "https://chat-api.juhebot.com"
+      private_base_url: "${JUHE_PRIVATE_BASE_URL}"
+      websocket_url: "wss://chat-api.juhebot.com/ws/juwe"
+
+      # Access control.
+      dm_policy: allowlist
+      allow_from:
+        - "S:REPLACE_WITH_ALLOWED_DM"
+      group_policy: allowlist
+      group_allow_from:
+        - "R:REPLACE_WITH_ALLOWED_GROUP"
+
+      # Inbound attachment handling.
+      inbound_attachment_max_bytes: 20971520
+
+      # Private inbound object storage (S3-compatible / MinIO).
+      inbound_s3_endpoint_url: "${JUHE_INBOUND_S3_ENDPOINT_URL}"
+      inbound_s3_region: "${JUHE_INBOUND_S3_REGION}"
+      inbound_s3_bucket: "${JUHE_INBOUND_S3_BUCKET}"
+      inbound_s3_access_key: "${JUHE_INBOUND_S3_ACCESS_KEY}"
+      inbound_s3_secret_key: "${JUHE_INBOUND_S3_SECRET_KEY}"
+      inbound_s3_use_https: false
+      inbound_s3_addressing_style: path
+
+      # Temporary object storage for outbound Juhe uploads (optional).
+      temp_s3_endpoint_url: "${JUHE_S3_ENDPOINT_URL}"
+      temp_s3_region: "${JUHE_S3_REGION}"
+      temp_s3_bucket: "${JUHE_S3_BUCKET}"
+      temp_s3_access_key: "${JUHE_S3_ACCESS_KEY}"
+      temp_s3_secret_key: "${JUHE_S3_SECRET_KEY}"
+      temp_s3_prefix: "juhe-temp"
+      temp_s3_url_expires_seconds: 3600
+      temp_s3_addressing_style: virtual

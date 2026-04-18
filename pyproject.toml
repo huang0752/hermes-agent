@@ -44,7 +44,7 @@ messaging = ["python-telegram-bot[webhooks]>=22.6,<23", "discord.py[voice]>=2.7.
 juhe = [
   "aiohttp>=3.13.3,<4",
   "boto3>=1.40.0,<2",
-  "qwsaas @ git+ssh://git@github.com:22/huang0752/qwsaas.git@v0.1.0",
+  "qwsaas @ git+ssh://git@github.com:22/huang0752/qwsaas.git@v0.2.0",
 ]
 cron = ["croniter>=6.0.0,<7"]
 slack = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.27.0,<4"]

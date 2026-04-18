@@ -1961,7 +1961,7 @@ requires-dist = [
     { name = "python-telegram-bot", extras = ["webhooks"], marker = "extra == 'messaging'", specifier = ">=22.6,<23" },
     { name = "pywinpty", marker = "sys_platform == 'win32' and extra == 'pty'", specifier = ">=2.0.0,<3" },
     { name = "pyyaml", specifier = ">=6.0.2,<7" },
-    { name = "qwsaas", marker = "extra == 'juhe'", git = "ssh://git@github.com:22/huang0752/qwsaas.git?rev=v0.1.0" },
+    { name = "qwsaas", marker = "extra == 'juhe'", git = "ssh://git@github.com:22/huang0752/qwsaas.git?rev=v0.2.0" },
     { name = "requests", specifier = ">=2.33.0,<3" },
     { name = "rich", specifier = ">=14.3.3,<15" },
     { name = "simple-term-menu", marker = "extra == 'cli'", specifier = ">=1.0,<2" },
@@ -4216,8 +4216,8 @@ wheels = [
 
 [[package]]
 name = "qwsaas"
-version = "0.1.0"
-source = { git = "ssh://git@github.com:22/huang0752/qwsaas.git?rev=v0.1.0#095de21805aae3cb5255bf0fea150d0f53d78cb9" }
+version = "0.2.0"
+source = { git = "ssh://git@github.com:22/huang0752/qwsaas.git?rev=v0.2.0#abc633c2f78c7873087eda6f7cba8f52fefb67db" }
 dependencies = [
     { name = "aiohttp" },
     { name = "httpx" },

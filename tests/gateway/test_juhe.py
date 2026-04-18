@@ -3,12 +3,14 @@
 import inspect
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig, _apply_env_overrides
+from gateway.juhe_cache import JuheCacheStore
 from gateway.session import SessionSource
 
 
@@ -102,6 +104,34 @@ class TestJuheConfig:
         assert platform_config.extra["group_allow_from"] == "R:2001,R:2002"
         assert platform_config.home_channel == HomeChannel(Platform.JUHE, "S:1001", "Primary DM")
 
+    def test_apply_env_overrides_configures_juhe_inbound_s3_from_minio_aliases(self):
+        config = GatewayConfig()
+
+        with patch.dict(
+            os.environ,
+            {
+                "JUHE_APP_KEY": "env-app-key",
+                "JUHE_APP_SECRET": "env-app-secret",
+                "JUHE_GUID": "env-guid",
+                "MINIO_ENDPOINT": "124.220.81.138:9000",
+                "MINIO_ACCESS_KEY": "minio-ak",
+                "MINIO_SECRET_KEY": "minio-sk",
+                "MINIO_USE_HTTPS": "false",
+                "MINIO_REGION": "us-east-1",
+                "MINIO_DEFAULT_BUCKET": "wework",
+            },
+            clear=True,
+        ):
+            _apply_env_overrides(config)
+
+        platform_config = config.platforms[Platform.JUHE]
+        assert platform_config.extra["inbound_s3_endpoint_url"] == "http://124.220.81.138:9000"
+        assert platform_config.extra["inbound_s3_access_key"] == "minio-ak"
+        assert platform_config.extra["inbound_s3_secret_key"] == "minio-sk"
+        assert platform_config.extra["inbound_s3_region"] == "us-east-1"
+        assert platform_config.extra["inbound_s3_bucket"] == "wework"
+        assert platform_config.extra["inbound_s3_use_https"] is False
+
     def test_get_connected_platforms_includes_juhe_with_credentials(self):
         config = GatewayConfig(
             platforms={
@@ -185,6 +215,49 @@ class TestJuheAdapterInit:
         assert adapter._temp_s3_secret_key == "fallback-sk"
         assert adapter._ws_url == "wss://env.example/ws"
 
+    def test_reads_inbound_s3_config_from_minio_env_aliases(self, monkeypatch):
+        monkeypatch.setenv("JUHE_APP_KEY", "env-app")
+        monkeypatch.setenv("JUHE_APP_SECRET", "env-secret")
+        monkeypatch.setenv("JUHE_GUID", "env-guid")
+        monkeypatch.setenv("MINIO_ENDPOINT", "124.220.81.138:9000")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "minio-ak")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "minio-sk")
+        monkeypatch.setenv("MINIO_USE_HTTPS", "false")
+        monkeypatch.setenv("MINIO_REGION", "us-east-1")
+        monkeypatch.setenv("MINIO_DEFAULT_BUCKET", "wework")
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(PlatformConfig(enabled=True))
+
+        assert adapter._inbound_s3_endpoint_url == "http://124.220.81.138:9000"
+        assert adapter._inbound_s3_access_key == "minio-ak"
+        assert adapter._inbound_s3_secret_key == "minio-sk"
+        assert adapter._inbound_s3_region == "us-east-1"
+        assert adapter._inbound_s3_bucket == "wework"
+        assert adapter._inbound_s3_addressing_style == "path"
+
+    def test_resolve_inbound_s3_bucket_key_decodes_url_escaped_object_name(self):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+
+        bucket, key = adapter._resolve_inbound_s3_bucket_key(
+            "http://124.220.81.138:9000/wework/wwcdn/2026-04-18/%E6%B5%8B%E8%AF%95.docx"
+        )
+
+        assert bucket == "wework"
+        assert key == "wwcdn/2026-04-18/测试.docx"
+
 
 class TestJuheConnect:
     @pytest.mark.asyncio
@@ -206,6 +279,37 @@ class TestJuheConnect:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_code == "juhe_missing_credentials"
         assert "JUHE_APP_KEY" in (adapter.fatal_error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_connect_runs_startup_sync(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+        from gateway.platforms.juhe import JuheAdapter
+
+        fake_ws_client = SimpleNamespace(connect=AsyncMock(), close=AsyncMock())
+        fake_task = SimpleNamespace(cancel=MagicMock())
+        
+        def fake_create_task(coro):
+            coro.close()
+            return fake_task
+
+        monkeypatch.setattr(juhe_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(juhe_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(juhe_module, "QWSAAS_AVAILABLE", True)
+        monkeypatch.setattr(juhe_module, "JuheWsClient", MagicMock(return_value=fake_ws_client))
+        monkeypatch.setattr(juhe_module.asyncio, "create_task", fake_create_task)
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"app_key": "app", "app_secret": "secret", "guid": "guid"},
+            )
+        )
+        monkeypatch.setattr(adapter, "_run_startup_sync", AsyncMock())
+
+        success = await adapter.connect()
+
+        assert success is True
+        adapter._run_startup_sync.assert_awaited_once()
 
 
 class TestJuhePolicyHelpers:
@@ -359,6 +463,127 @@ class TestJuheInbound:
         assert event.source.chat_type == "dm"
 
     @pytest.mark.asyncio
+    async def test_callback_updates_local_cache_and_recent_message_index(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content": '{"msg":"hello indexed"}',
+                    "sender": "1001",
+                    "sender_name": "Alice",
+                    "roomid": "2001",
+                    "room_name": "Dev Group",
+                    "msg_id": "msg-1",
+                    "appinfo": "appinfo-1",
+                    "refer_id": 0,
+                    "seq": "7272648",
+                },
+            }
+        )
+
+        assert success is True
+        cache = JuheCacheStore()
+        assert cache.search_contacts("Alice")[0]["user_id"] == "1001"
+        assert cache.get_room("2001")["roomname"] == "Dev Group"
+        assert cache.get_message(message_id="msg-1")["appinfo"] == "appinfo-1"
+        assert cache.load_sync_state()["message_sync_key"] == "7272648"
+
+    @pytest.mark.asyncio
+    async def test_refer_id_nonzero_callback_is_indexed_but_not_dispatched(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content": '{"msg":"duplicate callback"}',
+                    "sender": "1001",
+                    "sender_name": "Alice",
+                    "msg_id": "msg-refer-1",
+                    "appinfo": "appinfo-refer-1",
+                    "refer_id": 123,
+                    "seq": "7272649",
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_not_awaited()
+        cache = JuheCacheStore()
+        assert cache.get_message(message_id="msg-refer-1")["appinfo"] == "appinfo-refer-1"
+
+    @pytest.mark.asyncio
+    async def test_startup_sync_replays_new_message_sync_records(self, tmp_path, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        store = JuheCacheStore()
+        store.update_sync_state({"message_sync_key": "1"})
+
+        monkeypatch.setattr(
+            juhe_module,
+            "sync_msg",
+            AsyncMock(
+                return_value={
+                    "error_code": 0,
+                    "data": {
+                        "max_sync_key": "2",
+                        "continue_flag": 0,
+                        "msg_list": [
+                            {
+                                "msg_type": 2,
+                                "content": '{"msg":"hello from sync"}',
+                                "sender": "1001",
+                                "sender_name": "Alice",
+                                "msg_id": "sync-msg-1",
+                                "appinfo": "sync-appinfo-1",
+                                "refer_id": 0,
+                                "seq": "2",
+                            }
+                        ],
+                    },
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "sync_contact",
+            AsyncMock(return_value={"error_code": 0, "data": {"last_seq": "", "contact_list": []}}),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "get_room_list",
+            AsyncMock(return_value={"error_code": 0, "data": {"roomdata": {"datas": []}, "next_start": 0, "total": 0}}),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "sync_label_list",
+            AsyncMock(return_value={"error_code": 0, "data": {"seq": "", "label_items": [], "has_next": False}}),
+        )
+
+        await adapter._run_startup_sync()
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "hello from sync"
+        assert JuheCacheStore().load_sync_state()["message_sync_key"] == "2"
+
+    @pytest.mark.asyncio
     async def test_batch_callback_dispatches_each_text_message(self):
         adapter = _make_adapter()
         adapter.handle_message = AsyncMock()
@@ -388,10 +613,27 @@ class TestJuheInbound:
         assert adapter.handle_message.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_unsupported_message_is_acknowledged_and_replied_to(self):
+    async def test_image_message_dispatches_cached_attachment_event(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
         adapter = _make_adapter()
         adapter.handle_message = AsyncMock()
-        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, error=None))
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    data=b"image-bytes",
+                    file_name="photo.jpg",
+                    content_type="image/jpeg",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "cache_image_from_bytes",
+            MagicMock(return_value="/tmp/cached-photo.jpg"),
+        )
 
         success = await adapter._handle_callback_event(
             {
@@ -399,7 +641,7 @@ class TestJuheInbound:
                 "notify_type": 11010,
                 "data": {
                     "msg_type": 5,
-                    "content": '{"data":{"image":{"url":"https://example.com/a.jpg"}}}',
+                    "content": '{"data":{"image":{"url":"https://example.com/a.jpg","file_name":"photo.jpg"}}}',
                     "sender": "1001",
                     "msg_id": "msg-1",
                 },
@@ -407,8 +649,64 @@ class TestJuheInbound:
         )
 
         assert success is True
-        adapter.handle_message.assert_not_awaited()
-        adapter.send.assert_awaited_once_with("S:1001", "暂不支持图片消息，当前仅支持文本消息。")
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "[Received image: photo.jpg]"
+        assert event.message_type == juhe_module.MessageType.PHOTO
+        assert event.media_urls == ["/tmp/cached-photo.jpg"]
+        assert event.media_types == ["image/jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_cdn_image_callback_dispatches_cached_attachment_event(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    data=b"image-bytes",
+                    file_name="image.jpg",
+                    content_type="image/jpeg",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "cache_image_from_bytes",
+            MagicMock(return_value="/tmp/cached-image.jpg"),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 5,
+                    "content_type": 101,
+                    "sender": "1001",
+                    "id": "img-1",
+                    "file_name": "",
+                    "cdn": {
+                        "size": 224064,
+                        "md5": "md5",
+                        "aes_key": "aes",
+                        "auth_key": "auth",
+                        "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                    },
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "[Received image: image.jpg]"
+        assert event.message_type == juhe_module.MessageType.PHOTO
+        assert event.media_urls == ["/tmp/cached-image.jpg"]
+        assert event.media_types == ["image/jpeg"]
 
     @pytest.mark.asyncio
     async def test_msg_type_one_is_not_treated_as_text(self):
@@ -432,6 +730,256 @@ class TestJuheInbound:
         assert success is True
         adapter.handle_message.assert_not_awaited()
         adapter.send.assert_awaited_once_with("S:1001", "暂不支持撤回消息，当前仅支持文本消息。")
+
+    @pytest.mark.asyncio
+    async def test_file_message_download_failure_falls_back_to_metadata_text(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(side_effect=RuntimeError("download failed")),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content": json.dumps(
+                        {
+                            "data": {
+                                "file": {
+                                    "file_name": "report.pdf",
+                                    "url": "https://files.example/report.pdf",
+                                }
+                            }
+                        }
+                    ),
+                    "sender": "1001",
+                    "msg_id": "msg-file-1",
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "[Received document metadata only: report.pdf (download unavailable)]"
+        assert event.message_type == juhe_module.MessageType.DOCUMENT
+        assert event.media_urls == []
+        assert event.media_types == []
+
+    @pytest.mark.asyncio
+    async def test_large_attachment_falls_back_to_metadata_only(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(side_effect=juhe_module.QwSaasRequestError("attachment exceeds max_bytes")),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content": json.dumps(
+                        {
+                            "data": {
+                                "file": {
+                                    "file_name": "big.zip",
+                                    "url": "https://files.example/big.zip",
+                                    "file_size": 1000,
+                                }
+                            }
+                        }
+                    ),
+                    "sender": "1001",
+                    "msg_id": "msg-file-2",
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "[Received document metadata only: big.zip (exceeds download limit)]"
+        assert event.message_type == juhe_module.MessageType.DOCUMENT
+        assert event.media_urls == []
+
+    @pytest.mark.asyncio
+    async def test_private_object_access_uses_inbound_s3_fallback(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter._inbound_s3_endpoint_url = "http://124.220.81.138:9000"
+        adapter._inbound_s3_access_key = "minio-ak"
+        adapter._inbound_s3_secret_key = "minio-sk"
+        adapter._inbound_s3_bucket = "wework"
+        adapter._inbound_s3_addressing_style = "path"
+        adapter.handle_message = AsyncMock()
+
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(
+                side_effect=juhe_module.QwSaasPrivateObjectAccessError(
+                    "resolved private CDN object is not publicly readable",
+                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
+                    status_code=403,
+                )
+            ),
+        )
+        fake_body = MagicMock()
+        fake_body.read.return_value = b"%PDF-1.4\n"
+        fake_client = MagicMock()
+        fake_client.get_object.return_value = {"Body": fake_body, "ContentType": "application/pdf"}
+        monkeypatch.setattr(adapter, "_build_inbound_s3_client", MagicMock(return_value=fake_client))
+        monkeypatch.setattr(
+            juhe_module,
+            "cache_document_from_bytes",
+            MagicMock(return_value="/tmp/report.pdf"),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content": json.dumps(
+                        {
+                            "data": {
+                                "file": {
+                                    "file_name": "report.pdf",
+                                    "url": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                                }
+                            }
+                        }
+                    ),
+                    "sender": "1001",
+                    "msg_id": "msg-file-private-1",
+                },
+            }
+        )
+
+        assert success is True
+        fake_client.get_object.assert_called_once_with(Bucket="wework", Key="wwcdn/private/report.pdf")
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "[Received document: report.pdf]"
+        assert event.message_type == juhe_module.MessageType.DOCUMENT
+        assert event.media_urls == ["/tmp/report.pdf"]
+        assert event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_private_object_access_without_inbound_s3_config_falls_back_to_metadata(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(
+                side_effect=juhe_module.QwSaasPrivateObjectAccessError(
+                    "resolved private CDN object is not publicly readable",
+                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
+                    status_code=403,
+                )
+            ),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content": json.dumps(
+                        {
+                            "data": {
+                                "file": {
+                                    "file_name": "report.pdf",
+                                    "url": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                                }
+                            }
+                        }
+                    ),
+                    "sender": "1001",
+                    "msg_id": "msg-file-private-2",
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "[Received document metadata only: report.pdf (download unavailable)]"
+        assert event.message_type == juhe_module.MessageType.DOCUMENT
+        assert event.media_urls == []
+
+    @pytest.mark.asyncio
+    async def test_message_with_text_and_document_preserves_text(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    data=b"%PDF-1.4\n",
+                    file_name="report.pdf",
+                    content_type="application/pdf",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "cache_document_from_bytes",
+            MagicMock(return_value="/tmp/report.pdf"),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content": json.dumps(
+                        {
+                            "msg": "please review",
+                            "data": {
+                                "file": {
+                                    "file_name": "report.pdf",
+                                    "url": "https://files.example/report.pdf",
+                                }
+                            },
+                        }
+                    ),
+                    "sender": "1001",
+                    "msg_id": "msg-file-3",
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "please review"
+        assert event.message_type == juhe_module.MessageType.DOCUMENT
+        assert event.media_urls == ["/tmp/report.pdf"]
+        assert event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
     async def test_duplicate_message_is_ignored(self):
@@ -911,3 +1459,23 @@ class TestSendJuheStandalone:
         }
         adapter.send.assert_not_awaited()
         adapter.send_document.assert_awaited_once_with("S:1001", str(file_path))
+
+
+class TestJuheExampleFiles:
+    def test_env_example_has_juhe_vars(self):
+        env_path = Path(__file__).resolve().parents[2] / ".env.example"
+        content = env_path.read_text(encoding="utf-8")
+
+        assert "JUHE_APP_KEY" in content
+        assert "JUHE_INBOUND_ATTACHMENT_MAX_BYTES" in content
+        assert "JUHE_INBOUND_S3_ENDPOINT_URL" in content
+        assert "MINIO_ENDPOINT" in content
+
+    def test_config_example_has_juhe_platform_block(self):
+        config_path = Path(__file__).resolve().parents[2] / "config.example.yaml"
+        content = config_path.read_text(encoding="utf-8")
+
+        assert "platforms:" in content
+        assert "juhe:" in content
+        assert "inbound_attachment_max_bytes" in content
+        assert "inbound_s3_endpoint_url" in content

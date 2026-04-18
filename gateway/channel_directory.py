@@ -84,6 +84,9 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
             continue
+        if plat == Platform.JUHE:
+            platforms[plat_name] = _build_juhe_directory_entries()
+            continue
         platforms[plat_name] = _build_from_sessions(plat_name)
 
     directory = {
@@ -173,6 +176,52 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
     except Exception as e:
         logger.debug("Channel directory: failed to read sessions for %s: %s", platform_name, e)
 
+    return entries
+
+
+def _build_juhe_directory_entries() -> List[Dict[str, str]]:
+    """Build Juhe entries from the dedicated Juhe cache, falling back to sessions."""
+    entries: List[Dict[str, str]] = []
+    seen_ids: set[str] = set()
+
+    try:
+        from gateway.juhe_cache import JuheCacheStore
+
+        store = JuheCacheStore()
+        for contact in store.list_contacts():
+            user_id = str(contact.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            entry_id = f"S:{user_id}"
+            seen_ids.add(entry_id)
+            entries.append(
+                {
+                    "id": entry_id,
+                    "name": str(contact.get("name") or user_id),
+                    "type": "dm",
+                }
+            )
+
+        for room in store.list_rooms():
+            room_id = str(room.get("room_id") or room.get("roomid") or room.get("id") or "").strip()
+            if not room_id:
+                continue
+            entry_id = f"R:{room_id}"
+            seen_ids.add(entry_id)
+            entries.append(
+                {
+                    "id": entry_id,
+                    "name": str(room.get("roomname") or room.get("name") or room_id),
+                    "type": "group",
+                }
+            )
+    except Exception as e:
+        logger.debug("Channel directory: failed to read Juhe cache: %s", e)
+
+    for entry in _build_from_sessions("juhe"):
+        if entry["id"] in seen_ids:
+            continue
+        entries.append(entry)
     return entries
 
 
