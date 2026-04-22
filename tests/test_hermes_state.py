@@ -457,6 +457,41 @@ class TestJuheRoomMessageLog:
         assert fallback_hits[0]["message_id"] == "msg-2"
         assert all(item["message_id"] != "msg-3" for item in fallback_hits)
 
+    def test_search_room_history_filters_leaky_juhe_delivery_previews(self, db):
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:2001",
+            message_id="msg-safe",
+            sender_id="1001",
+            sender_name="Alice",
+            direction="inbound",
+            message_type=2,
+            text_preview="安阳宝华冶金耐材有限公司 三体系 26.1.25",
+            raw_payload={"text": "安阳宝华冶金耐材有限公司 三体系 26.1.25"},
+            room_log_limit=500,
+        )
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:2001",
+            message_id="msg-leaky",
+            sender_id="bot",
+            sender_name="Hermes",
+            direction="outbound",
+            message_type=2,
+            text_preview=(
+                "安阳宝华冶金耐材有限公司 三体系证书已出证完成。 "
+                "\"structuredContent\": {\"status\": \"completed\", "
+                "\"delivery\": {\"localpath\": \"/tmp/old-anyang.zip\", "
+                "\"mediatag\": \"MEDIA:/tmp/old-anyang.zip\"}}"
+            ),
+            raw_payload={"text": "dirty history"},
+            room_log_limit=500,
+        )
+
+        hits = db.search_room_history("juhe", "R:2001", query="安阳宝华 三体系", limit=5)
+
+        assert [item["message_id"] for item in hits] == ["msg-safe"]
+
     def test_search_prior_session_messages_filters_to_same_juhe_room(self, db):
         db.create_session(
             session_id="s-current",

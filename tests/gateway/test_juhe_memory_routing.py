@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 
 
@@ -11,6 +11,14 @@ def _build_runner():
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.JUHE: PlatformConfig(
+                enabled=True,
+                extra={},
+            )
+        }
+    )
     runner._session_db = None
     return runner
 
@@ -80,3 +88,82 @@ def test_apply_juhe_explicit_memory_note_appends_room_confirmation(monkeypatch):
 
     assert response.endswith("已记到本群记忆。")
     assert getattr(event, "_juhe_skip_auto_room_memory", False) is True
+
+
+def test_attach_juhe_recall_context_skips_room_history_for_normal_certificate_request():
+    from gateway.run import GatewayRunner
+
+    runner = _build_runner()
+    runner._session_db = MagicMock()
+    runner._session_db.search_room_history.return_value = [
+        {
+            "message_id": "old-hit-1",
+            "created_at": 1776852982.0,
+            "sender_name": "Hermes",
+            "text_preview": "安阳宝华冶金耐材有限公司 三体系证书已出证完成。",
+            "triggered": True,
+            "direction": "outbound",
+        }
+    ]
+
+    event = SimpleNamespace(message_id="current-msg")
+    source = SessionSource(
+        platform=Platform.JUHE,
+        chat_id="R:2001",
+        chat_type="group",
+        user_id="1001",
+    )
+    session_entry = SimpleNamespace(session_id="session-current")
+
+    GatewayRunner._attach_juhe_recall_context(
+        runner,
+        event=event,
+        source=source,
+        session_entry=session_entry,
+        message_text="深圳市万洁环境产业有限公司 中天三体系 26年4.12 范围全要",
+        is_new_session=False,
+    )
+
+    assert getattr(event, "_juhe_relevant_room_history_text", "") == ""
+    assert getattr(event, "_juhe_relevant_prior_agent_turns_text", "") == ""
+    runner._session_db.search_prior_session_messages.assert_not_called()
+
+
+def test_attach_juhe_recall_context_keeps_history_for_explicit_history_question():
+    from gateway.run import GatewayRunner
+
+    runner = _build_runner()
+    runner._session_db = MagicMock()
+    runner._session_db.search_room_history.return_value = [
+        {
+            "message_id": "old-hit-1",
+            "created_at": 1776852982.0,
+            "sender_name": "Hermes",
+            "text_preview": "之前讨论过：深圳市万洁环境产业有限公司按中天三体系处理。",
+            "triggered": True,
+            "direction": "outbound",
+        }
+    ]
+    runner._session_db.search_prior_session_messages.return_value = []
+
+    event = SimpleNamespace(message_id="current-msg")
+    source = SessionSource(
+        platform=Platform.JUHE,
+        chat_id="R:2001",
+        chat_type="group",
+        user_id="1001",
+    )
+    session_entry = SimpleNamespace(session_id="session-current")
+
+    GatewayRunner._attach_juhe_recall_context(
+        runner,
+        event=event,
+        source=source,
+        session_entry=session_entry,
+        message_text="之前那个公司怎么处理的",
+        is_new_session=False,
+    )
+
+    history_text = getattr(event, "_juhe_relevant_room_history_text", "")
+    assert "History answer rule" in history_text
+    assert "之前讨论过" in history_text

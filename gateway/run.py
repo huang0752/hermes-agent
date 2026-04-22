@@ -633,6 +633,75 @@ def _strip_local_delivery_paths_from_response(text: str, paths: list[str]) -> st
     return cleaned.strip()
 
 
+def _current_turn_messages(
+    messages: List[dict[str, Any]] | None,
+    history_offset: Any,
+) -> list[dict[str, Any]]:
+    """Return only the messages produced in the current agent turn."""
+    if not messages:
+        return []
+
+    try:
+        offset = int(history_offset or 0)
+    except (TypeError, ValueError):
+        offset = 0
+
+    if offset <= 0:
+        return list(messages)
+    if offset >= len(messages):
+        return []
+    return list(messages[offset:])
+
+
+def _media_tag_filename(media_tag: str) -> str:
+    """Return a log-safe filename for a MEDIA tag."""
+    raw_value = str(media_tag or "").strip()
+    media_value = raw_value.split("MEDIA:", 1)[1] if raw_value.startswith("MEDIA:") else raw_value
+
+    url = _normalize_delivery_url(media_value)
+    if url:
+        parsed = urlsplit(url)
+        filename = unquote(Path(parsed.path).name)
+        return filename or parsed.netloc or "remote-media"
+
+    return Path(media_value).name or "media"
+
+
+def _debug_log_media_sources(
+    session_key: str,
+    *,
+    assistant_media_tags: list[str] | None = None,
+    current_tool_media_tags: list[str] | None = None,
+    hidden_media_tags: list[str] | None = None,
+) -> None:
+    """Emit low-noise media-origin debug logs without leaking paths."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    session_prefix = str(session_key or "")[:64]
+    seen: set[tuple[str, str]] = set()
+    source_buckets = (
+        ("assistant_media", assistant_media_tags or []),
+        ("current_tool_payload", current_tool_media_tags or []),
+        ("hidden_artifact", hidden_media_tags or []),
+    )
+    for source_name, tags in source_buckets:
+        for tag in tags:
+            normalized = str(tag or "").strip()
+            if not normalized.startswith("MEDIA:"):
+                continue
+            dedupe_key = (source_name, normalized)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            logger.debug(
+                "media-origin session=%s source=%s file=%s",
+                session_prefix,
+                source_name,
+                _media_tag_filename(normalized),
+            )
+
+
 def _augment_final_response_with_tool_media(
     final_response: str,
     messages: List[dict[str, Any]] | None,
@@ -4200,7 +4269,7 @@ class GatewayRunner:
             char_limit=recall_config["char_limit"],
             status=room_status,
         )
-        if room_context and (room_hits or history_question):
+        if room_context and history_question:
             setattr(event, "_juhe_relevant_room_history_text", room_context)
 
         should_recall_prior_turns = history_question or (
@@ -9703,9 +9772,29 @@ class GatewayRunner:
             # references structured download URLs in its visible reply.
             hidden_media_tags = self._delivery_artifacts.media_tags_for_session(_delivery_session_key)
             self._delivery_artifacts.clear_session(_delivery_session_key)
+            current_turn_messages = _current_turn_messages(
+                result.get("messages", []),
+                result.get("history_offset", len(agent_history)),
+            )
+            current_tool_media_tags, _, _ = _collect_tool_result_media_tags(
+                current_turn_messages,
+                _history_media_paths,
+            )
+            assistant_media_entries, _ = BasePlatformAdapter.extract_media(final_response)
+            assistant_media_tags = [
+                f"MEDIA:{media_path}"
+                for media_path, _is_voice in assistant_media_entries
+                if media_path
+            ]
+            _debug_log_media_sources(
+                _delivery_session_key,
+                assistant_media_tags=assistant_media_tags,
+                current_tool_media_tags=current_tool_media_tags,
+                hidden_media_tags=hidden_media_tags,
+            )
             final_response = _augment_final_response_with_tool_media(
                 final_response,
-                result.get("messages", []),
+                current_turn_messages,
                 _history_media_paths,
                 hidden_media_tags=hidden_media_tags,
             )

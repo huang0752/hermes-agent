@@ -15,6 +15,7 @@ import pytest
 from gateway.run import (
     _augment_final_response_with_tool_media,
     _collect_tool_result_media_tags,
+    _current_turn_messages,
 )
 from gateway.platforms.base import BasePlatformAdapter
 
@@ -431,6 +432,90 @@ class TestStructuredDeliveryUrlExtraction:
         assert "压缩包已生成。" in visible_text
         assert "请查收。" in visible_text
         assert f"MEDIA:{local_path}" in augmented
+
+    def test_current_turn_message_slice_excludes_stale_history_tool_payloads(self):
+        """Old tool payloads must not be rescanned for local delivery artifacts."""
+        old_path = "/tmp/certificate-render-artifacts/old-anyang.zip"
+        all_messages = [
+            {"role": "user", "content": "安阳宝华冶金耐材有限公司 三体系"},
+            {
+                "role": "tool",
+                "tool_call_id": "old-tool",
+                "content": json.dumps(
+                    {
+                        "status": "completed",
+                        "delivery": {
+                            "filename": "old-anyang.zip",
+                            "local_path": old_path,
+                            "media_tag": f"MEDIA:{old_path}",
+                        },
+                    }
+                ),
+            },
+            {"role": "user", "content": "深圳市万洁环境产业有限公司 中天三体系 26年4.12 范围全要"},
+            {
+                "role": "tool",
+                "tool_call_id": "current-tool",
+                "content": json.dumps({"status": "draft_only"}),
+            },
+        ]
+
+        current_messages = _current_turn_messages(all_messages, 2)
+        augmented = _augment_final_response_with_tool_media(
+            "已查到档案公司。",
+            current_messages,
+            set(),
+        )
+
+        assert augmented == "已查到档案公司。"
+        assert old_path not in augmented
+
+    def test_current_turn_message_slice_keeps_new_local_delivery_artifact(self):
+        """Current-turn artifacts should still be promoted after history slicing."""
+        old_path = "/tmp/certificate-render-artifacts/old-anyang.zip"
+        current_path = "/tmp/certificate-render-artifacts/current-wanjie.zip"
+        all_messages = [
+            {"role": "user", "content": "安阳宝华冶金耐材有限公司 三体系"},
+            {
+                "role": "tool",
+                "tool_call_id": "old-tool",
+                "content": json.dumps(
+                    {
+                        "status": "completed",
+                        "delivery": {
+                            "filename": "old-anyang.zip",
+                            "local_path": old_path,
+                            "media_tag": f"MEDIA:{old_path}",
+                        },
+                    }
+                ),
+            },
+            {"role": "user", "content": "深圳市万洁环境产业有限公司 中天三体系 26年4.12 范围全要"},
+            {
+                "role": "tool",
+                "tool_call_id": "current-tool",
+                "content": json.dumps(
+                    {
+                        "status": "completed",
+                        "delivery": {
+                            "filename": "current-wanjie.zip",
+                            "local_path": current_path,
+                            "media_tag": f"MEDIA:{current_path}",
+                        },
+                    }
+                ),
+            },
+        ]
+
+        current_messages = _current_turn_messages(all_messages, 2)
+        augmented = _augment_final_response_with_tool_media(
+            "万洁草案如下。",
+            current_messages,
+            set(),
+        )
+
+        assert f"MEDIA:{current_path}" in augmented
+        assert old_path not in augmented
 
 
 if __name__ == "__main__":

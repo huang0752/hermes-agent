@@ -1676,6 +1676,28 @@ class SessionDB:
             ):
                 bucket[row_id] = candidate
 
+    @staticmethod
+    def _is_leaky_juhe_delivery_preview(item: Dict[str, Any]) -> bool:
+        """Exclude polluted Juhe delivery previews from room-history recall."""
+        if str(item.get("direction") or "").strip().lower() != "outbound":
+            return False
+
+        preview = str(item.get("text_preview") or "").strip()
+        if not preview:
+            return False
+
+        lowered = preview.lower()
+        leak_markers = (
+            "structuredcontent",
+            "structured_content",
+            "localpath",
+            "local_path",
+            "mediatag",
+            "media_tag",
+            "media:",
+        )
+        return any(marker in lowered for marker in leak_markers)
+
     def search_room_history(
         self,
         platform: str,
@@ -1767,7 +1789,15 @@ class SessionDB:
                 int(item.get("id") or 0),
             ),
             reverse=True,
-        )[:fetch_limit]
+        )
+
+        if normalized_platform == "juhe":
+            ordered = [
+                item for item in ordered
+                if not self._is_leaky_juhe_delivery_preview(item)
+            ]
+
+        ordered = ordered[:fetch_limit]
 
         return [
             {
