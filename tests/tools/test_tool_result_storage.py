@@ -206,26 +206,18 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
-    def test_certificate_render_job_result_keeps_download_url_for_delivery_pipeline(self):
-        url = (
-            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
-            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=minioadmin&Signature=abc"
-        )
+    def test_certificate_render_job_result_is_sanitized_for_model(self):
+        url = "https://example.com/final.zip?sig=1"
         content = json.dumps(
             {
-                "result": json.dumps(
-                    {
-                        "status": "completed",
-                        "job_id": 92,
-                        "download_url": url,
-                        "progress": {"output_url": url},
-                    }
-                ),
-                "structuredContent": {
-                    "status": "completed",
-                    "job_id": 92,
-                    "download_url": url,
-                    "progress": {"output_url": url},
+                "status": "completed",
+                "job_id": 92,
+                "download_url": url,
+                "delivery": {
+                    "filename": "final.zip",
+                    "local_path": "/tmp/final.zip",
+                    "size": 2048,
+                    "media_tag": "MEDIA:/tmp/final.zip",
                 },
             },
             ensure_ascii=False,
@@ -233,15 +225,39 @@ class TestMaybePersistToolResult:
 
         result = maybe_persist_tool_result(
             content=content,
-            tool_name="mcp_local_create_render_job_and_wait",
+            tool_name="mcp_local_materialize_render_job_artifact",
             tool_use_id="tc_render_job",
             env=None,
             threshold=50_000,
         )
+        payload = json.loads(result)
 
-        assert '"download_url"' in result
-        assert url in result
-        assert "Do not use terminal, curl, wget" not in result
+        assert payload["delivery"]["filename"] == "final.zip"
+        assert "local_path" not in payload["delivery"]
+        assert "media_tag" not in payload["delivery"]
+        assert "download_url" not in payload
+
+    def test_download_url_lookup_result_is_sanitized_for_model(self):
+        content = json.dumps(
+            {
+                "job_id": 92,
+                "download_url": "https://example.com/final.zip?sig=1",
+            },
+            ensure_ascii=False,
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="mcp_local_get_render_job_download_url",
+            tool_use_id="tool-call-2",
+            env=None,
+            threshold=50_000,
+        )
+        payload = json.loads(result)
+
+        assert payload["job_id"] == 92
+        assert payload["delivery"]["status"] == "needs_materialization"
+        assert "download_url" not in payload
 
     def test_below_threshold_returns_unchanged(self):
         content = "small result"

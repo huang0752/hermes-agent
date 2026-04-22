@@ -3,11 +3,15 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
+    SendResult,
     media_reference_suffix,
     safe_url_for_log,
     utf16_len,
@@ -20,6 +24,23 @@ class TestSecretCaptureGuidance:
         message = GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
         assert "local cli" in message.lower()
         assert "~/.hermes/.env" in message
+
+
+class _DummyAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True), Platform.TELEGRAM)
+
+    async def connect(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
+        return SendResult(success=True, message_id="text-1")
+
+    async def get_chat_info(self, chat_id: str):
+        return {"name": chat_id, "type": "dm"}
 
 
 class TestSafeUrlForLog:
@@ -45,6 +66,17 @@ class TestSafeUrlForLog:
         assert safe_url_for_log(url, max_len=3) == "..."
         assert safe_url_for_log(url, max_len=2) == ".."
         assert safe_url_for_log(url, max_len=0) == ""
+
+
+class TestDocumentDeliveryFallback:
+    @pytest.mark.asyncio
+    async def test_base_send_document_fails_closed_for_local_path(self):
+        adapter = _DummyAdapter()
+
+        result = await adapter.send_document("room-1", "/tmp/report.zip")
+
+        assert result.success is False
+        assert "native document delivery" in (result.error or "").lower()
 
 
 class TestMediaReferenceSuffix:

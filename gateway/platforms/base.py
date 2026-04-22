@@ -1227,12 +1227,14 @@ class BasePlatformAdapter(ABC):
         Send a document/file natively via the platform API.
 
         Override in subclasses to send files as downloadable attachments.
-        Default falls back to sending the file path as text.
+        Default fails closed so adapters do not leak local filesystem paths
+        or raw URLs into user-visible text when native attachment delivery
+        is unavailable.
         """
-        text = f"📎 File: {file_path}"
-        if caption:
-            text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+        return SendResult(
+            success=False,
+            error="Native document delivery is not implemented for this platform adapter.",
+        )
 
     async def send_image_file(
         self,

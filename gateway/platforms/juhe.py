@@ -356,6 +356,25 @@ def _strip_certificate_delivery_links_for_juhe(content: Any) -> str:
     return cleaned.strip()
 
 
+def _strip_local_delivery_paths_for_juhe(content: Any) -> str:
+    """Remove visible local artifact paths from outbound Juhe text."""
+    text = str(content or "")
+    if not text:
+        return ""
+
+    cleaned = text
+    patterns = (
+        r"(?im)^[ \t]*本地路径[：:]\s*.+$",
+        r"(?im)^[ \t]*local (?:filesystem )?path[：:]\s*.+$",
+    )
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]+$", "", cleaned)
+    return cleaned.strip()
+
+
 def _has_textual_mention_fallback(text: Any) -> bool:
     value = str(text or "")
     if not value:
@@ -2683,6 +2702,7 @@ class JuheAdapter(BasePlatformAdapter):
 
     def format_message(self, content: str) -> str:
         cleaned = _strip_visible_markdown_for_juhe(content)
+        cleaned = _strip_local_delivery_paths_for_juhe(cleaned)
         return _strip_certificate_delivery_links_for_juhe(cleaned)
 
     async def send_image(
@@ -2762,8 +2782,6 @@ class JuheAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        if is_certificate_render_job_url(file_path):
-            return SendResult(success=False, error=JUHE_CERTIFICATE_REMOTE_DELIVERY_ERROR)
         return await self._send_file_from_source(
             chat_id=chat_id,
             source=file_path,

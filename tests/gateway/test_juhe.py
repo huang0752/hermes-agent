@@ -2677,7 +2677,10 @@ class TestGatewayIntegration:
         assert "juhe" in PLATFORM_HINTS["juhe"].lower()
         assert "MEDIA:https://..." not in PLATFORM_HINTS["juhe"]
         assert "certificate_workflow_tool" in PLATFORM_HINTS["juhe"]
-        assert "MEDIA:/absolute/path" in PLATFORM_HINTS["juhe"]
+        assert "materialize_render_job_artifact" in PLATFORM_HINTS["juhe"]
+        assert "hidden artifact channel" in PLATFORM_HINTS["juhe"]
+        assert "MEDIA:/absolute/path" not in PLATFORM_HINTS["juhe"]
+        assert "Do not write local filesystem paths" in PLATFORM_HINTS["juhe"]
 
 
 class TestSendJuheStandalone:
@@ -2823,7 +2826,7 @@ class TestSendJuheStandalone:
         adapter.send.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_juhe_sanitizes_certificate_render_job_url_in_text_instead_of_blocking(self):
+    async def test_send_juhe_forwards_certificate_render_job_url_text_to_adapter(self):
         from tools.send_message_tool import _send_juhe
 
         adapter = MagicMock()
@@ -2848,8 +2851,8 @@ class TestSendJuheStandalone:
         assert result["success"] is True
         adapter.send.assert_awaited_once()
         sent_text = adapter.send.await_args.args[1]
-        assert "certificate_render_jobs" not in sent_text
-        assert "下载链接" not in sent_text
+        assert "certificate_render_jobs" in sent_text
+        assert "下载链接" in sent_text
 
     @pytest.mark.asyncio
     async def test_send_juhe_expands_local_media_home_path(self, monkeypatch, tmp_path):

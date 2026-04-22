@@ -336,14 +336,12 @@ PLATFORM_HINTS = {
     "juhe": (
         "You are communicating through Juhe, an enterprise WeChat bridge. "
         "Use plain text formatting and avoid markdown-specific rendering assumptions. "
-        "For normal native delivery, include MEDIA:/absolute/path/to/file in your "
-        "response so Hermes can stage and send the local artifact. Use "
-        "`certificate_workflow_tool` as the standard execution surface for "
-        "certificate delivery, and only deliver the wrapper-provided local artifact. "
-        "Do not expose or send raw certificate render-job download URLs or "
-        "HTTP(S)-based MEDIA links for certificate packages. Do not improvise "
-        "manual delivery workarounds with terminal, curl, wget, Python download "
-        "scripts, or ad-hoc remote-link forwarding."
+        "Use `certificate_workflow_tool` as the standard execution surface for "
+        "certificate delivery. If you used MCP render tools directly, call "
+        "`materialize_render_job_artifact` with the render job id before final "
+        "delivery. Hermes will handle native file sending from the hidden artifact "
+        "channel. Do not write local filesystem paths, MEDIA tags, or raw "
+        "certificate render-job download URLs in the visible reply."
     ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "

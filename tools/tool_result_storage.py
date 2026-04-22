@@ -28,7 +28,7 @@ import os
 import shlex
 import uuid
 
-from gateway.delivery_rules import is_certificate_render_job_url
+from gateway.delivery_artifacts import sanitize_tool_result_for_model
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -41,15 +41,6 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
-_CERTIFICATE_RENDER_MCP_TOOLS = {
-    "mcp_local_create_render_job_and_wait",
-    "mcp_local_get_render_job_download_url",
-}
-_CERTIFICATE_DELIVERY_GUIDANCE = (
-    "Certificate render artifact metadata is available. "
-    "Do not use terminal, curl, wget, Python download scripts, or raw download URLs for delivery. "
-    "Use the workflow wrapper's local artifact and send that local file natively."
-)
 
 
 def _resolve_storage_dir(env) -> str:
@@ -124,97 +115,6 @@ def _build_persisted_message(
     return msg
 
 
-def _try_load_json(content: str):
-    try:
-        return json.loads(content)
-    except Exception:
-        return None
-
-
-def _extract_delivery_urls(payload) -> list[str]:
-    urls: list[str] = []
-
-    def _visit(value):
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                if key in {"download_url", "output_url", "url"} and isinstance(nested, str):
-                    candidate = nested.strip()
-                    if candidate:
-                        urls.append(candidate)
-                else:
-                    _visit(nested)
-        elif isinstance(value, list):
-            for item in value:
-                _visit(item)
-        elif isinstance(value, str):
-            loaded = _try_load_json(value)
-            if loaded is not None and loaded is not value:
-                _visit(loaded)
-
-    _visit(payload)
-    deduped: list[str] = []
-    seen = set()
-    for url in urls:
-        if url not in seen:
-            deduped.append(url)
-            seen.add(url)
-    return deduped
-
-
-def _strip_certificate_render_delivery_urls(payload):
-    """Remove certificate render-job URLs from model-visible tool payloads."""
-
-    def _visit(value):
-        if isinstance(value, dict):
-            cleaned = {}
-            for key, nested in value.items():
-                if key in {"download_url", "output_url", "url"} and isinstance(nested, str):
-                    candidate = nested.strip()
-                    if candidate and is_certificate_render_job_url(candidate):
-                        continue
-                cleaned[key] = _visit(nested)
-            return cleaned
-        if isinstance(value, list):
-            return [_visit(item) for item in value]
-        if isinstance(value, str):
-            loaded = _try_load_json(value)
-            if loaded is not None and loaded is not value:
-                return json.dumps(_visit(loaded), ensure_ascii=False)
-        return value
-
-    return _visit(payload)
-
-
-def _augment_certificate_delivery_result(content: str, tool_name: str) -> str:
-    if tool_name not in _CERTIFICATE_RENDER_MCP_TOOLS:
-        return content
-
-    payload = _try_load_json(content)
-    if not isinstance(payload, dict):
-        return content
-
-    urls = _extract_delivery_urls(payload)
-    if not urls:
-        return content
-
-    payload = _strip_certificate_render_delivery_urls(payload)
-
-    delivery = payload.get("delivery")
-    if not isinstance(delivery, dict):
-        delivery = {}
-    delivery.setdefault("status", "ready")
-    delivery.pop("media_tag", None)
-    delivery["requires_local_artifact"] = True
-    if urls and is_certificate_render_job_url(urls[0]):
-        delivery["remote_delivery_allowed"] = False
-    delivery["message"] = _CERTIFICATE_DELIVERY_GUIDANCE
-    payload["delivery"] = delivery
-    payload["delivery_message"] = _CERTIFICATE_DELIVERY_GUIDANCE
-    payload.pop("media_tag", None)
-
-    return json.dumps(payload, ensure_ascii=False)
-
-
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -240,7 +140,7 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
-    content = _augment_certificate_delivery_result(content, tool_name)
+    content = sanitize_tool_result_for_model(tool_name, content)
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):

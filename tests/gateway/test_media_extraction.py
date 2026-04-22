@@ -249,30 +249,6 @@ class TestStructuredDeliveryUrlExtraction:
         assert voice_directive is False
         assert raw_urls == [url]
 
-    def test_certificate_render_job_download_url_promotes_to_media_for_juhe_delivery(self):
-        """Juhe delivery should promote certificate render-job URLs into MEDIA tags."""
-        url = (
-            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
-            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
-        )
-        messages = [
-            {
-                "role": "tool",
-                "tool_call_id": "cert-job-juhe",
-                "content": json.dumps({"success": True, "download_url": url}),
-            }
-        ]
-
-        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(
-            messages,
-            set(),
-            allow_certificate_render_media=True,
-        )
-
-        assert tags == [f"MEDIA:{url}"]
-        assert voice_directive is False
-        assert raw_urls == [url]
-
     def test_prefers_local_delivery_artifact_over_remote_download_url(self):
         """When a tool result contains a local delivery artifact, remote links stay internal."""
         url = "https://example.com/render/output/report.zip?token=secret"
@@ -304,8 +280,8 @@ class TestStructuredDeliveryUrlExtraction:
         assert voice_directive is False
         assert raw_urls == []
 
-    def test_prefers_local_artifact_even_when_juhe_remote_promotion_is_enabled(self):
-        """Juhe remote-url promotion must not override explicit local delivery artifacts."""
+    def test_prefers_local_artifact_when_certificate_url_is_present(self):
+        """Explicit local delivery artifacts must keep remote render URLs internal."""
         url = (
             "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
             "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
@@ -327,15 +303,41 @@ class TestStructuredDeliveryUrlExtraction:
             }
         ]
 
-        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(
-            messages,
-            set(),
-            allow_certificate_render_media=True,
-        )
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(messages, set())
 
         assert tags == [f"MEDIA:{local_path}"]
         assert voice_directive is False
         assert raw_urls == []
+
+    def test_collect_tool_result_media_prefers_hidden_local_artifact(self):
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "cert-job",
+                "content": json.dumps(
+                    {
+                        "status": "completed",
+                        "job_id": 92,
+                        "delivery": {
+                            "filename": "final.zip",
+                            "size": 2048,
+                        },
+                    }
+                ),
+            }
+        ]
+        hidden_media_tags = ["MEDIA:/tmp/final.zip"]
+
+        augmented = _augment_final_response_with_tool_media(
+            "压缩包已生成。",
+            messages,
+            set(),
+            hidden_media_tags=hidden_media_tags,
+        )
+
+        assert "MEDIA:/tmp/final.zip" in augmented
+        assert "download_url" not in augmented
+        assert "/tmp/final.zip" in augmented
 
     def test_augment_final_response_strips_raw_download_link_and_appends_media(self):
         """Visible text should not retain a raw delivery URL once MEDIA is synthesized."""

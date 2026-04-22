@@ -15,11 +15,6 @@ import time
 from urllib.parse import urlparse
 
 from agent.redact import redact_sensitive_text
-from gateway.delivery_rules import (
-    JUHE_CERTIFICATE_REMOTE_DELIVERY_ERROR,
-    contains_certificate_render_job_url,
-    is_certificate_render_job_url,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +73,6 @@ def _media_source_extension(value: str) -> str:
 def _is_document_media_source(value: str) -> bool:
     ext = _media_source_extension(value)
     return bool(ext) and ext not in _IMAGE_EXTS and ext not in _VIDEO_EXTS and ext not in _AUDIO_EXTS
-
-
-def _juhe_certificate_delivery_error() -> dict:
-    return _error(JUHE_CERTIFICATE_REMOTE_DELIVERY_ERROR)
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -427,9 +418,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # --- Juhe: native URL-backed media delivery via the adapter helper ---
     if platform == Platform.JUHE:
-        if contains_certificate_render_job_url(message):
-            return _juhe_certificate_delivery_error()
-
         document_media = [entry for entry in media_files if _is_document_media_source(entry[0])]
         trailing_media = [entry for entry in media_files if not _is_document_media_source(entry[0])]
 
@@ -1065,9 +1053,6 @@ async def _send_juhe(extra, chat_id, message, media_files=None):
 
     media_files = media_files or []
 
-    if contains_certificate_render_job_url(message):
-        return _juhe_certificate_delivery_error()
-
     try:
         from gateway.config import PlatformConfig
 
@@ -1091,8 +1076,6 @@ async def _send_juhe(extra, chat_id, message, media_files=None):
                     trailing_media.append(media_entry)
 
             for media_path, _is_voice in document_media:
-                if is_certificate_render_job_url(media_path):
-                    return _juhe_certificate_delivery_error()
                 normalized_media_path = media_path
                 if not _looks_like_http_url(media_path):
                     normalized_media_path = os.path.expanduser(media_path)

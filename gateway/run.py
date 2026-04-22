@@ -262,6 +262,7 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter
+from gateway.delivery_artifacts import DeliveryArtifactStore
 import gateway.document_text as document_text
 from gateway.document_text import (
     build_document_context_for_agent,
@@ -611,10 +612,33 @@ def _strip_delivered_urls_from_response(text: str, urls: list[str]) -> str:
     return cleaned.strip()
 
 
+def _strip_local_delivery_paths_from_response(text: str, paths: list[str]) -> str:
+    """Remove raw local artifact paths from visible assistant text."""
+    cleaned = str(text or "")
+    if not cleaned or not paths:
+        return cleaned
+
+    for path in sorted({str(item).strip() for item in paths if str(item).strip()}, key=len, reverse=True):
+        escaped = re.escape(path)
+        cleaned = re.sub(
+            rf"(?im)^[^\S\r\n]*(?:[-*]\s*)?(?:\d+[、.)．]\s*)?(?:本地路径|文件路径|local path|local file)?\s*[:：]?\s*{escaped}\s*$\n?",
+            "",
+            cleaned,
+        )
+        cleaned = cleaned.replace(path, "")
+
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]+$", "", cleaned)
+    return cleaned.strip()
+
+
 def _augment_final_response_with_tool_media(
     final_response: str,
     messages: List[dict[str, Any]] | None,
     history_media_paths: set[str] | None,
+    *,
+    hidden_media_tags: list[str] | None = None,
 ) -> str:
     """Append tool-result media tags and strip raw delivery URLs from visible text."""
     response = str(final_response or "")
@@ -623,6 +647,17 @@ def _augment_final_response_with_tool_media(
         history_media_paths,
     )
     response = _strip_delivered_urls_from_response(response, raw_delivery_urls)
+
+    extra_tags = [tag for tag in (hidden_media_tags or []) if tag not in media_tags]
+    media_tags.extend(extra_tags)
+    local_delivery_paths = []
+    for tag in media_tags:
+        if not tag.startswith("MEDIA:"):
+            continue
+        media_path = tag.split("MEDIA:", 1)[1]
+        if _normalize_local_delivery_path(media_path):
+            local_delivery_paths.append(media_path)
+    response = _strip_local_delivery_paths_from_response(response, local_delivery_paths)
 
     existing_media, _ = BasePlatformAdapter.extract_media(response)
     existing_paths = {path for path, _ in existing_media}
@@ -1056,6 +1091,7 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._delivery_artifacts = DeliveryArtifactStore()
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -1102,6 +1138,23 @@ class GatewayRunner:
 
 
 
+
+    def _record_delivery_artifacts(
+        self,
+        session_key: str,
+        tool_use_id: str,
+        tool_name: str,
+        content: str,
+    ) -> None:
+        try:
+            self._delivery_artifacts.record(
+                session_key=session_key,
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                content=content,
+            )
+        except Exception:
+            logger.debug("Failed to record delivery artifacts", exc_info=True)
 
     # -- Setup skill availability ----------------------------------------
 
@@ -9387,7 +9440,26 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
+            _delivery_session_key = session_key or ""
+            self._delivery_artifacts.clear_session(_delivery_session_key)
+
+            def _tool_complete_callback(
+                tool_call_id,
+                function_name,
+                function_args,
+                function_result,
+                *,
+                _session_key=_delivery_session_key,
+            ):
+                self._record_delivery_artifacts(
+                    _session_key,
+                    tool_call_id,
+                    function_name,
+                    function_result,
+                )
+
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_complete_callback = _tool_complete_callback
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -9610,6 +9682,7 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
+                self._delivery_artifacts.clear_session(_delivery_session_key)
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
                 return {
                     "final_response": error_msg,
@@ -9628,10 +9701,13 @@ class GatewayRunner:
             # Promote tool-result delivery artifacts into MEDIA tags so the
             # adapter can send native attachments even when the model only
             # references structured download URLs in its visible reply.
+            hidden_media_tags = self._delivery_artifacts.media_tags_for_session(_delivery_session_key)
+            self._delivery_artifacts.clear_session(_delivery_session_key)
             final_response = _augment_final_response_with_tool_media(
                 final_response,
                 result.get("messages", []),
                 _history_media_paths,
+                hidden_media_tags=hidden_media_tags,
             )
             
             # Sync session_id: the agent may have created a new session during
