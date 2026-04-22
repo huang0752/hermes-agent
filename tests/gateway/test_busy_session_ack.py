@@ -8,6 +8,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from gateway.config import Platform
 
 # ---------------------------------------------------------------------------
 # Minimal stubs so we can import gateway code without heavy deps
@@ -38,19 +39,31 @@ from gateway.platforms.base import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_event(text="hello", chat_id="123", platform_val="telegram"):
+def _make_event(
+    text="hello",
+    chat_id="123",
+    platform_val="telegram",
+    chat_type="private",
+    user_id="user1",
+    user_name=None,
+    message_id="msg1",
+):
     """Build a minimal MessageEvent."""
+    platform = platform_val
+    if isinstance(platform_val, str):
+        platform = MagicMock(value=platform_val)
     source = SessionSource(
-        platform=MagicMock(value=platform_val),
+        platform=platform,
         chat_id=chat_id,
-        chat_type="private",
-        user_id="user1",
+        chat_type=chat_type,
+        user_id=user_id,
+        user_name=user_name,
     )
     evt = MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=source,
-        message_id="msg1",
+        message_id=message_id,
     )
     return evt
 
@@ -63,6 +76,7 @@ def _make_runner():
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
+    runner._juhe_deferred_batch = {}
     runner._busy_ack_ts = {}
     runner._draining = False
     runner.adapters = {}
@@ -291,3 +305,94 @@ class TestBusySessionAck:
 
         result = await runner._handle_active_session_busy_message(event, sk)
         assert result is False  # not handled, let default path try
+
+    @pytest.mark.asyncio
+    async def test_juhe_busy_messages_are_deferred_without_interrupt_and_ack_every_time(self):
+        """Juhe group follow-ups should queue in the deferred batch instead of interrupting."""
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val="juhe")
+        runner.adapters[Platform.JUHE] = adapter
+
+        session_key = "agent:main:juhe:group:R:2001"
+        agent = MagicMock()
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time() - 20
+
+        event1 = _make_event(
+            text="logo用刚发的",
+            chat_id="R:2001",
+            platform_val=Platform.JUHE,
+            chat_type="group",
+            user_id="alice",
+            user_name="Alice",
+            message_id="juhe-1",
+        )
+        event2 = _make_event(
+            text="另外做一套",
+            chat_id="R:2001",
+            platform_val=Platform.JUHE,
+            chat_type="group",
+            user_id="bob",
+            user_name="Bob",
+            message_id="juhe-2",
+        )
+
+        result1 = await runner._handle_active_session_busy_message(event1, session_key)
+        result2 = await runner._handle_active_session_busy_message(event2, session_key)
+
+        assert result1 is True
+        assert result2 is True
+        assert agent.interrupt.call_count == 0
+        assert session_key in runner._juhe_deferred_batch
+        assert list(runner._juhe_deferred_batch[session_key]) == [event1, event2]
+        assert adapter._pending_messages == {}
+        assert adapter._send_with_retry.call_count == 2
+
+        sent_texts = [call.kwargs["content"] for call in adapter._send_with_retry.call_args_list]
+        assert all("已记录" in text for text in sent_texts)
+        assert all("一并处理" in text for text in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_juhe_deferred_overflow_sends_drop_ack(self):
+        """Overflowed Juhe follow-ups should be dropped with an explicit ack."""
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val="juhe")
+        runner.adapters[Platform.JUHE] = adapter
+
+        session_key = "agent:main:juhe:group:R:2001"
+        agent = MagicMock()
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time() - 20
+        runner._juhe_deferred_batch[session_key] = []
+
+        for idx in range(10):
+            runner._juhe_deferred_batch[session_key].append(
+                _make_event(
+                    text=f"queued-{idx}",
+                    chat_id="R:2001",
+                    platform_val=Platform.JUHE,
+                    chat_type="group",
+                    user_id=f"user-{idx}",
+                    user_name=f"User {idx}",
+                    message_id=f"juhe-q-{idx}",
+                )
+            )
+
+        overflow = _make_event(
+            text="queued-overflow",
+            chat_id="R:2001",
+            platform_val=Platform.JUHE,
+            chat_type="group",
+            user_id="overflow",
+            user_name="Overflow",
+            message_id="juhe-overflow",
+        )
+
+        result = await runner._handle_active_session_busy_message(overflow, session_key)
+
+        assert result is True
+        assert len(runner._juhe_deferred_batch[session_key]) == 10
+        assert agent.interrupt.call_count == 0
+
+        content = adapter._send_with_retry.call_args.kwargs["content"]
+        assert "ignored" in content.lower() or "resend" in content.lower()

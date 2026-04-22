@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+from collections import deque
 import contextvars
 import json
 import logging
@@ -620,12 +621,22 @@ def _strip_local_delivery_paths_from_response(text: str, paths: list[str]) -> st
 
     for path in sorted({str(item).strip() for item in paths if str(item).strip()}, key=len, reverse=True):
         escaped = re.escape(path)
+        path_token = rf'(?:`{escaped}`|"{escaped}"|\'{escaped}\'|{escaped})'
+        # Strip the full MEDIA:<path> tag first to avoid leaving an orphaned
+        # "MEDIA:" prefix. Keep this aligned with BasePlatformAdapter.extract_media(),
+        # which accepts optional whitespace and quoted/backticked local paths.
+        cleaned = re.sub(rf'[`"\']?MEDIA:\s*{path_token}[`"\']?', "", cleaned)
         cleaned = re.sub(
-            rf"(?im)^[^\S\r\n]*(?:[-*]\s*)?(?:\d+[、.)．]\s*)?(?:本地路径|文件路径|local path|local file)?\s*[:：]?\s*{escaped}\s*$\n?",
+            rf"(?im)^[^\S\r\n]*(?:[-*]\s*)?(?:\d+[、.)．]\s*)?(?:本地路径|文件路径|local path|local file)?\s*[:：]?\s*{path_token}\s*$\n?",
             "",
             cleaned,
         )
-        cleaned = cleaned.replace(path, "")
+        cleaned = re.sub(
+            rf'(^|[\s([<"\'`]){path_token}(?=$|[\s)\]>,.;:："\'`])',
+            r"\1",
+            cleaned,
+            flags=re.M,
+        )
 
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -1143,6 +1154,7 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._juhe_deferred_batch: Dict[str, deque[MessageEvent]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
 
         # Cache AIAgent instances per session to preserve prompt caching.
@@ -1934,6 +1946,168 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    _JUHE_DEFERRED_BATCH_MAX_EVENTS = 10
+    _JUHE_DEFERRED_BATCH_MAX_CHARS = 2000
+
+    def _is_juhe_deferred_candidate(self, event: MessageEvent) -> bool:
+        source = getattr(event, "source", None)
+        return (
+            getattr(source, "platform", None) == Platform.JUHE
+            and getattr(source, "chat_type", None) == "group"
+            and not event.is_command()
+        )
+
+    def _estimate_juhe_deferred_event_chars(self, event: MessageEvent) -> int:
+        return len(str(getattr(event, "text", "") or "")) + len(
+            str(getattr(event, "_juhe_pending_context_text", "") or "")
+        )
+
+    def _enqueue_juhe_deferred_event(self, session_key: str, event: MessageEvent) -> bool:
+        batch = getattr(self, "_juhe_deferred_batch", {}).get(session_key)
+        if batch is None:
+            batch = deque()
+            self._juhe_deferred_batch[session_key] = batch
+        elif not isinstance(batch, deque):
+            batch = deque(batch)
+            self._juhe_deferred_batch[session_key] = batch
+
+        estimated_total = sum(
+            self._estimate_juhe_deferred_event_chars(item) for item in batch
+        ) + self._estimate_juhe_deferred_event_chars(event)
+        if (
+            len(batch) >= self._JUHE_DEFERRED_BATCH_MAX_EVENTS
+            or estimated_total > self._JUHE_DEFERRED_BATCH_MAX_CHARS
+        ):
+            return False
+
+        batch.append(event)
+        return True
+
+    def _has_juhe_deferred_batch(self, session_key: str) -> bool:
+        return bool(getattr(self, "_juhe_deferred_batch", {}).get(session_key))
+
+    def _pop_juhe_deferred_batch(self, session_key: str) -> list[MessageEvent]:
+        batch = getattr(self, "_juhe_deferred_batch", {}).pop(session_key, None)
+        if batch is None:
+            return []
+        if isinstance(batch, deque):
+            return list(batch)
+        return list(batch)
+
+    def _clear_juhe_deferred_batch(self, session_key: str) -> None:
+        getattr(self, "_juhe_deferred_batch", {}).pop(session_key, None)
+
+    def _clear_all_juhe_deferred_batches(self) -> None:
+        getattr(self, "_juhe_deferred_batch", {}).clear()
+
+    async def _send_juhe_deferred_busy_ack(self, event: MessageEvent, *, accepted: bool) -> None:
+        adapter = self.adapters.get(getattr(event.source, "platform", None))
+        if not adapter:
+            return
+
+        thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        if accepted:
+            message = (
+                "⏳ 当前任务还在处理中，已记录这条消息，"
+                "任务完成后一并处理。"
+            )
+        else:
+            message = (
+                "⚠️ Current task is still running, and too many Juhe follow-ups "
+                "are already queued. Some later @ messages were ignored — "
+                "please resend after the current task finishes."
+            )
+
+        await adapter._send_with_retry(
+            chat_id=event.source.chat_id,
+            content=message,
+            reply_to=event.message_id,
+            metadata=thread_meta,
+        )
+
+    async def _render_juhe_deferred_batch(
+        self,
+        *,
+        deferred_events: list[MessageEvent],
+        updated_history: List[Dict[str, Any]],
+        fallback_source: SessionSource,
+    ) -> Optional[Dict[str, Any]]:
+        rendered_blocks: list[str] = []
+        frozen_history = updated_history
+        next_source = fallback_source
+        next_message_id: Optional[str] = None
+
+        for event in deferred_events:
+            current_source = getattr(event, "source", None) or fallback_source
+            processed = await self._prepare_inbound_message_text(
+                event=event,
+                source=current_source,
+                history=frozen_history,
+            )
+            if processed is None:
+                continue
+
+            block = self._augment_agent_message_with_platform_context(
+                event=event,
+                message_text=processed,
+            ).strip()
+            if not block:
+                continue
+
+            rendered_blocks.append(block)
+            next_source = current_source
+            next_message_id = getattr(event, "message_id", None) or next_message_id
+
+        if not rendered_blocks:
+            return None
+
+        merged_message = "[Messages received while you were working]"
+        overflow_note = "\n\n[Some deferred follow-up content was truncated.]"
+
+        for index, block in enumerate(rendered_blocks, start=1):
+            entry = f"\n\n{index}.\n{block}"
+            if len(merged_message) + len(entry) <= self._JUHE_DEFERRED_BATCH_MAX_CHARS:
+                merged_message += entry
+                continue
+
+            remaining = self._JUHE_DEFERRED_BATCH_MAX_CHARS - len(merged_message)
+            if remaining <= 0:
+                break
+
+            note = ""
+            if len(overflow_note) < remaining:
+                note = overflow_note
+
+            body_budget = remaining - len(note)
+            if body_budget > 0:
+                merged_message += entry[:body_budget].rstrip()
+            if note and len(merged_message) + len(note) <= self._JUHE_DEFERRED_BATCH_MAX_CHARS:
+                merged_message += note
+            break
+
+        return {
+            "message": merged_message[: self._JUHE_DEFERRED_BATCH_MAX_CHARS],
+            "source": next_source,
+            "message_id": next_message_id,
+        }
+
+    async def _take_juhe_deferred_followup(
+        self,
+        *,
+        session_key: str,
+        updated_history: List[Dict[str, Any]],
+        fallback_source: SessionSource,
+    ) -> Optional[Dict[str, Any]]:
+        deferred_events = self._pop_juhe_deferred_batch(session_key)
+        if not deferred_events:
+            return None
+
+        return await self._render_juhe_deferred_batch(
+            deferred_events=deferred_events,
+            updated_history=updated_history,
+            fallback_source=fallback_source,
+        )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -1967,6 +2141,11 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
+
+        if self._is_juhe_deferred_candidate(event):
+            accepted = self._enqueue_juhe_deferred_event(session_key, event)
+            await self._send_juhe_deferred_busy_ack(event, accepted=accepted)
+            return True
 
         # Store the message so it's processed as the next turn after the
         # interrupt causes the current run to exit.
@@ -2886,6 +3065,7 @@ class GatewayRunner:
             self.adapters.clear()
             self._running_agents.clear()
             self._pending_messages.clear()
+            self._clear_all_juhe_deferred_batches()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
@@ -3410,6 +3590,7 @@ class GatewayRunner:
                 if adapter and hasattr(adapter, 'get_pending_message'):
                     adapter.get_pending_message(_quick_key)  # consume and discard
                 self._pending_messages.pop(_quick_key, None)
+                self._clear_juhe_deferred_batch(_quick_key)
                 if _quick_key in self._running_agents:
                     del self._running_agents[_quick_key]
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
@@ -3431,6 +3612,7 @@ class GatewayRunner:
                 if adapter and hasattr(adapter, 'get_pending_message'):
                     adapter.get_pending_message(_quick_key)  # consume and discard
                 self._pending_messages.pop(_quick_key, None)
+                self._clear_juhe_deferred_batch(_quick_key)
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
                 if _quick_key in self._running_agents:
@@ -3486,8 +3668,13 @@ class GatewayRunner:
                     # Force-clean the sentinel so the session is unlocked.
                     if _quick_key in self._running_agents:
                         del self._running_agents[_quick_key]
+                    self._clear_juhe_deferred_batch(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
                     return "⚡ Force-stopped. The agent was still starting — session unlocked."
+                if self._is_juhe_deferred_candidate(event):
+                    accepted = self._enqueue_juhe_deferred_event(_quick_key, event)
+                    await self._send_juhe_deferred_busy_ack(event, accepted=accepted)
+                    return None
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
@@ -3502,6 +3689,10 @@ class GatewayRunner:
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
+            if self._is_juhe_deferred_candidate(event):
+                accepted = self._enqueue_juhe_deferred_event(_quick_key, event)
+                await self._send_juhe_deferred_busy_ack(event, accepted=accepted)
+                return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
             if _quick_key in self._pending_messages:
@@ -5202,6 +5393,7 @@ class GatewayRunner:
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
+        self._clear_juhe_deferred_batch(session_key)
         
         # Flush memories in the background (fire-and-forget) so the user
         # gets the "Session reset!" response immediately.
@@ -5397,6 +5589,7 @@ class GatewayRunner:
             # Force-clean the sentinel so the session is unlocked.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
+            self._clear_juhe_deferred_batch(session_key)
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
         if agent:
@@ -5405,8 +5598,10 @@ class GatewayRunner:
             # keep it locked forever.
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
+            self._clear_juhe_deferred_batch(session_key)
             return "⚡ Stopped. You can continue this session."
         else:
+            self._clear_juhe_deferred_batch(session_key)
             return "No active task to stop."
 
     async def _handle_restart_command(self, event: MessageEvent) -> str:
@@ -10220,6 +10415,23 @@ class GatewayRunner:
                 pending_event = None
                 pending = None
 
+            updated_history = result.get("messages", history) if result else history
+            deferred_followup = None
+            if (
+                not pending_event
+                and not pending
+                and session_key
+                and source.platform == Platform.JUHE
+                and self._has_juhe_deferred_batch(session_key)
+            ):
+                deferred_followup = await self._take_juhe_deferred_followup(
+                    session_key=session_key,
+                    updated_history=updated_history,
+                    fallback_source=source,
+                )
+                if deferred_followup:
+                    pending = deferred_followup["message"]
+
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
@@ -10275,6 +10487,30 @@ class GatewayRunner:
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
+                            # Deliver MEDIA: file artifacts before sending the text.
+                            # adapter.send() strips local file paths via format_message(),
+                            # so any ZIP/document attached to first_response would be
+                            # silently lost if we pass it through the plain-text path.
+                            # Extract and dispatch them separately first.
+                            if "MEDIA:" in first_response and adapter:
+                                _fup_thread_meta = (
+                                    {"thread_id": source.thread_id}
+                                    if getattr(source, "thread_id", None)
+                                    else None
+                                )
+                                _fup_media, first_response = adapter.extract_media(first_response)
+                                for _fup_path, _fup_voice in _fup_media:
+                                    try:
+                                        await adapter.send_document(
+                                            chat_id=source.chat_id,
+                                            file_path=_fup_path,
+                                            metadata=_fup_thread_meta,
+                                        )
+                                    except Exception as _fup_err:
+                                        logger.warning(
+                                            "Failed to deliver media before queued follow-up: %s",
+                                            _fup_err,
+                                        )
                             await adapter.send(
                                 source.chat_id,
                                 first_response,
@@ -10286,11 +10522,14 @@ class GatewayRunner:
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
 
-                updated_history = result.get("messages", history)
                 next_source = source
                 next_message = pending
                 next_message_id = None
-                if pending_event is not None:
+                if deferred_followup is not None:
+                    next_source = deferred_followup.get("source") or source
+                    next_message = deferred_followup["message"]
+                    next_message_id = deferred_followup.get("message_id")
+                elif pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     next_message = await self._prepare_inbound_message_text(
                         event=pending_event,

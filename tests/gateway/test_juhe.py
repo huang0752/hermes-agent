@@ -80,6 +80,7 @@ class TestJuheConfig:
                 "JUHE_WEBSOCKET_URL": "wss://juhe.example.com/ws/juhe",
                 "JUHE_ALLOWED_USERS": "S:1001,S:1002",
                 "JUHE_GROUP_ALLOWED_CHATS": "R:2001,R:2002",
+                "JUHE_MENTION_TARGETS": "魔法老人",
                 "JUHE_HOME_CHANNEL": "S:1001",
                 "JUHE_HOME_CHANNEL_NAME": "Primary DM",
             },
@@ -106,6 +107,7 @@ class TestJuheConfig:
         assert platform_config.extra["allow_from"] == "S:1001,S:1002"
         assert platform_config.extra["group_policy"] == "allowlist"
         assert platform_config.extra["group_allow_from"] == "R:2001,R:2002"
+        assert platform_config.extra["mention_targets"] == "魔法老人"
         assert platform_config.home_channel == HomeChannel(Platform.JUHE, "S:1001", "Primary DM")
 
     def test_apply_env_overrides_configures_juhe_inbound_s3_from_minio_aliases(self):
@@ -175,6 +177,7 @@ class TestJuheAdapterInit:
                     "websocket_url": "wss://custom.example/ws",
                     "group_policy": "allowlist",
                     "group_allow_from": ["R:2001"],
+                    "mention_targets": ["魔法老人"],
                 },
             )
         )
@@ -193,6 +196,7 @@ class TestJuheAdapterInit:
         assert adapter._ws_url == "wss://custom.example/ws"
         assert adapter._group_policy == "allowlist"
         assert adapter._group_allow_from == ["R:2001"]
+        assert adapter._mention_targets == ["魔法老人"]
 
     def test_falls_back_to_env_vars(self, monkeypatch):
         monkeypatch.delenv("JUHE_S3_ACCESS_KEY", raising=False)
@@ -200,6 +204,7 @@ class TestJuheAdapterInit:
         monkeypatch.setenv("JUHE_APP_KEY", "env-app")
         monkeypatch.setenv("JUHE_APP_SECRET", "env-secret")
         monkeypatch.setenv("JUHE_GUID", "env-guid")
+        monkeypatch.setenv("JUHE_MENTION_TARGETS", "魔法老人")
         monkeypatch.setenv("JUHE_PRIVATE_BASE_URL", "https://env.example/private")
         monkeypatch.setenv("JUHE_S3_ENDPOINT_URL", "https://s3.env.example.com")
         monkeypatch.setenv("JUHE_S3_REGION", "cn-north-1")
@@ -219,6 +224,7 @@ class TestJuheAdapterInit:
         assert adapter._temp_s3_bucket == "temp-filechuan"
         assert adapter._temp_s3_access_key == "fallback-ak"
         assert adapter._temp_s3_secret_key == "fallback-sk"
+        assert adapter._mention_targets == ["魔法老人"]
         assert adapter._ws_url == "wss://env.example/ws"
 
     def test_reads_inbound_s3_config_from_minio_env_aliases(self, monkeypatch):
@@ -762,6 +768,30 @@ class TestJuhePolicyHelpers:
         assert adapter._should_trigger_group_reply("R:2001", "1001", ["bot"], "hello") is True
         assert adapter._should_trigger_group_reply("R:2001", "1001", [], "@bot hello") is True
         assert adapter._should_trigger_group_reply("R:2001", "1002", ["bot"], "hello") is False
+
+    def test_mention_targets_limit_group_triggering_to_named_bot(self):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
+                    "mention_targets": ["魔法老人"],
+                },
+            )
+        )
+
+        assert adapter._should_trigger_group_reply("R:2001", "1001", ["魔法老人"], "hello") is True
+        assert adapter._should_trigger_group_reply("R:2001", "1001", ["其他人"], "hello") is False
+        assert adapter._should_trigger_group_reply("R:2001", "1001", [], "@魔法老人 hello") is True
+        assert adapter._should_trigger_group_reply("R:2001", "1001", [], "@其他人 hello") is False
+        assert adapter._should_trigger_group_reply("R:2001", "1001", [], "@ㅤ hello") is False
 
     def test_dm_allowlist_uses_dynamic_access_control_json_when_present(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

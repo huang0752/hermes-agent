@@ -206,6 +206,7 @@ DEFAULT_OUTBOUND_DOCUMENT_DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 15.0
 DEFAULT_OUTBOUND_DOCUMENT_DOWNLOAD_RETRIES = 3
 SUPPORTED_ATTACHMENT_MESSAGE_TYPES = {MSG_TYPE_IMAGE, MSG_TYPE_VOICE, MSG_TYPE_VIDEO, MSG_TYPE_FILE}
 TEXTUAL_MENTION_RE = re.compile(r"(^|[\s\u2000-\u200b\u202f\u205f\u3000])@([^\s@]{1,64})")
+MENTION_TOKEN_TRIM_CHARS = ",，:：;；!！?？"
 JUHE_MEDIA_DIRECTIVE_RE = re.compile(r"(?im)^[ \t]*MEDIA:\s*.+$")
 JUHE_INSTRUCTION_LEAK_MARKERS = (
     "artifact, or equivalent non-link deliverable.",
@@ -380,6 +381,32 @@ def _has_textual_mention_fallback(text: Any) -> bool:
     if not value:
         return False
     return bool(TEXTUAL_MENTION_RE.search(value))
+
+
+def _normalize_mention_token(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("@"):
+        text = text[1:].strip()
+    text = text.strip(MENTION_TOKEN_TRIM_CHARS)
+    return text.casefold()
+
+
+def _extract_textual_mentions(text: Any) -> List[str]:
+    value = str(text or "")
+    if not value:
+        return []
+
+    mentions: List[str] = []
+    seen: set[str] = set()
+    for match in TEXTUAL_MENTION_RE.finditer(value):
+        token = _normalize_mention_token(match.group(2))
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        mentions.append(token)
+    return mentions
 
 
 def _strip_target_prefix(value: str) -> str:
@@ -693,6 +720,13 @@ class JuheAdapter(BasePlatformAdapter):
         if group_allow_from is None:
             group_allow_from = os.getenv("JUHE_GROUP_ALLOWED_CHATS", "")
         self._group_allow_from = _coerce_list(group_allow_from)
+        mention_targets = extra.get("mention_targets")
+        if mention_targets is None:
+            mention_targets = os.getenv("JUHE_MENTION_TARGETS", "")
+        self._mention_targets = _coerce_list(mention_targets)
+        self._normalized_mention_targets = {
+            token for item in self._mention_targets if (token := _normalize_mention_token(item))
+        }
         trigger_user_ids = extra.get("trigger_user_ids")
         if trigger_user_ids is None:
             trigger_user_ids = os.getenv("JUHE_TRIGGER_USER_IDS", "")
@@ -2241,7 +2275,20 @@ class JuheAdapter(BasePlatformAdapter):
         trigger_user_ids = self._access_control_store.get_group_trigger_user_ids()
         if not trigger_user_ids or not _entry_matches(trigger_user_ids, sender_id):
             return False
-        return bool(at_list) or _has_textual_mention_fallback(text)
+        return self._group_message_mentions_target(at_list, text)
+
+    def _group_message_mentions_target(self, at_list: List[str], text: str = "") -> bool:
+        if not self._normalized_mention_targets:
+            return bool(at_list) or _has_textual_mention_fallback(text)
+
+        structured_mentions = {
+            token for item in at_list if (token := _normalize_mention_token(item))
+        }
+        if structured_mentions & self._normalized_mention_targets:
+            return True
+
+        textual_mentions = set(_extract_textual_mentions(text))
+        return bool(textual_mentions & self._normalized_mention_targets)
 
     @staticmethod
     def _message_created_at(message: Any) -> float:

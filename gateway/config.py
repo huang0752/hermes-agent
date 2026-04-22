@@ -1229,6 +1229,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         juhe_groups = os.getenv("JUHE_GROUP_ALLOWED_CHATS", "").strip()
         if juhe_groups:
             config.platforms[Platform.JUHE].extra["group_allow_from"] = juhe_groups
+        juhe_mention_targets = os.getenv("JUHE_MENTION_TARGETS", "").strip()
+        if juhe_mention_targets:
+            config.platforms[Platform.JUHE].extra["mention_targets"] = juhe_mention_targets
         juhe_trigger_users = os.getenv("JUHE_TRIGGER_USER_IDS", "").strip()
         if juhe_trigger_users:
             config.platforms[Platform.JUHE].extra["trigger_user_ids"] = juhe_trigger_users

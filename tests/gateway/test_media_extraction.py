@@ -433,6 +433,40 @@ class TestStructuredDeliveryUrlExtraction:
         assert "请查收。" in visible_text
         assert f"MEDIA:{local_path}" in augmented
 
+    def test_augment_final_response_strips_manual_media_tag_with_whitespace_before_reappending(self):
+        """Manual MEDIA tags using optional post-colon whitespace should not leave an orphaned prefix."""
+        local_path = "/tmp/certificate-delivery/final-package.zip"
+        hidden_media_tags = [f"MEDIA:{local_path}"]
+
+        augmented = _augment_final_response_with_tool_media(
+            f"压缩包已生成。\nMEDIA: {local_path}",
+            [],
+            set(),
+            hidden_media_tags=hidden_media_tags,
+        )
+        media, visible_text = BasePlatformAdapter.extract_media(augmented)
+
+        assert media == [(local_path, False)]
+        assert visible_text == "压缩包已生成。"
+        assert augmented.count("MEDIA:") == 1
+
+    def test_augment_final_response_strips_manual_media_tag_with_quoted_path_before_reappending(self):
+        """Quoted manual MEDIA tags should not leave wrapper debris in the visible response."""
+        local_path = "/tmp/certificate-delivery/final package.zip"
+        hidden_media_tags = [f"MEDIA:{local_path}"]
+
+        augmented = _augment_final_response_with_tool_media(
+            f'压缩包已生成。\nMEDIA: "{local_path}"',
+            [],
+            set(),
+            hidden_media_tags=hidden_media_tags,
+        )
+        media, visible_text = BasePlatformAdapter.extract_media(augmented)
+
+        assert media == [(local_path, False)]
+        assert visible_text == "压缩包已生成。"
+        assert augmented.count("MEDIA:") == 1
+
     def test_current_turn_message_slice_excludes_stale_history_tool_payloads(self):
         """Old tool payloads must not be rescanned for local delivery artifacts."""
         old_path = "/tmp/certificate-render-artifacts/old-anyang.zip"

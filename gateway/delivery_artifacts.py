@@ -100,8 +100,14 @@ def sanitize_tool_result_for_model(tool_name: str, content: str) -> str:
     delivery = payload.get("delivery")
     if isinstance(delivery, dict):
         delivery = dict(delivery)
-        delivery.pop("local_path", None)
-        delivery.pop("media_tag", None)
+        local_path = delivery.pop("local_path", None)
+        had_tag = bool(delivery.pop("media_tag", None))
+        # If local delivery artifacts were stripped, tell the model that
+        # the Hermes send layer will deliver the file automatically.
+        # This prevents the agent from using execute_code to find the file
+        # and writing a manual MEDIA: tag, which causes duplicate delivery.
+        if local_path or had_tag:
+            delivery["send_hint"] = "文件已由 Hermes 平台自动发送，无需手动写 MEDIA: 标记或查找本地路径。"
         payload["delivery"] = delivery
         payload.pop("download_url", None)
         payload.pop("output_url", None)

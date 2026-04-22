@@ -99,6 +99,10 @@ def test_sanitize_tool_result_for_model_strips_local_delivery_secrets():
 
     assert payload["delivery"]["filename"] == "final.zip"
     assert payload["delivery"]["size"] == 2048
+    assert (
+        payload["delivery"]["send_hint"]
+        == "文件已由 Hermes 平台自动发送，无需手动写 MEDIA: 标记或查找本地路径。"
+    )
     assert "local_path" not in payload["delivery"]
     assert "media_tag" not in payload["delivery"]
     assert "download_url" not in payload
@@ -135,6 +139,10 @@ def test_sanitize_tool_result_for_model_unwraps_fastmcp_envelope():
     assert "structuredContent" not in payload
     assert payload["job_id"] == 95
     assert payload["delivery"]["filename"] == "wrapped.zip"
+    assert (
+        payload["delivery"]["send_hint"]
+        == "文件已由 Hermes 平台自动发送，无需手动写 MEDIA: 标记或查找本地路径。"
+    )
     assert "local_path" not in payload["delivery"]
     assert "media_tag" not in payload["delivery"]
     assert "download_url" not in payload

@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,10 +35,12 @@ def _make_runner():
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
+    runner.config.group_sessions_per_user = False
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
+    runner._juhe_deferred_batch = {}
     runner._pending_approvals = {}
     runner._voice_mode = {}
     runner._background_tasks = set()
@@ -323,6 +326,45 @@ async def test_stop_clears_pending_messages():
 
 
 # ------------------------------------------------------------------
+# Test 6d: /stop also clears Juhe deferred batches
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_stop_clears_juhe_deferred_batch():
+    """Explicit stop should discard Juhe deferred follow-ups for the session."""
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.JUHE,
+        chat_id="R:2001",
+        chat_type="group",
+        user_id="alice",
+    )
+    session_key = "agent:main:juhe:group:R:2001"
+
+    fake_agent = MagicMock()
+    runner._running_agents[session_key] = fake_agent
+    runner._juhe_deferred_batch[session_key] = deque(
+        [
+            MessageEvent(
+                text="later follow-up",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="juhe-pending-1",
+            )
+        ]
+    )
+
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    adapter.get_pending_message = MagicMock(return_value=None)
+    runner.adapters[Platform.JUHE] = adapter
+
+    stop_event = MessageEvent(text="/stop", message_type=MessageType.TEXT, source=source)
+    await runner._handle_message(stop_event)
+
+    assert session_key not in runner._juhe_deferred_batch
+
+
+# ------------------------------------------------------------------
 # Test 7: Shutdown skips sentinel entries
 # ------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -352,3 +394,42 @@ async def test_shutdown_skips_sentinel():
     # Real agent should have been interrupted
     real_agent.interrupt.assert_called_once()
     # Should not have raised on the sentinel
+
+
+# ------------------------------------------------------------------
+# Test 8: /new clears Juhe deferred batch before reset
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_new_clears_juhe_deferred_batch_before_reset():
+    """Reset/new should drop Juhe deferred follow-ups instead of draining them."""
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.JUHE,
+        chat_id="R:2001",
+        chat_type="group",
+        user_id="alice",
+    )
+    session_key = "agent:main:juhe:group:R:2001"
+    runner._running_agents[session_key] = MagicMock()
+    runner._juhe_deferred_batch[session_key] = deque(
+        [
+            MessageEvent(
+                text="queued follow-up",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="juhe-reset-1",
+            )
+        ]
+    )
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    adapter.get_pending_message = MagicMock(return_value=None)
+    runner.adapters[Platform.JUHE] = adapter
+    runner._handle_reset_command = AsyncMock(return_value="reset")
+
+    result = await runner._handle_message(
+        MessageEvent(text="/new", message_type=MessageType.TEXT, source=source)
+    )
+
+    assert result == "reset"
+    assert session_key not in runner._juhe_deferred_batch
