@@ -45,6 +45,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from memory_routing import BUILTIN_MEMORY_REVIEW_GUIDANCE, is_explicit_memory_request
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -2165,6 +2166,7 @@ class AIAgent:
         "preferences, or personal details worth remembering?\n"
         "2. Has the user expressed expectations about how you should behave, their work "
         "style, or ways they want you to operate?\n\n"
+        f"{BUILTIN_MEMORY_REVIEW_GUIDANCE}\n"
         "If something stands out, save it using the memory tool. "
         "If nothing is worth saving, just say 'Nothing to save.' and stop."
     )
@@ -2184,7 +2186,7 @@ class AIAgent:
         "**Memory**: Has the user revealed things about themselves — their persona, "
         "desires, preferences, or personal details? Has the user expressed expectations "
         "about how you should behave, their work style, or ways they want you to operate? "
-        "If so, save using the memory tool.\n\n"
+        f"If so, save using the memory tool.\n\n{BUILTIN_MEMORY_REVIEW_GUIDANCE}\n\n"
         "**Skills**: Was a non-trivial approach used to complete a task that required trial "
         "and error, or changing course due to experiential findings along the way, or did "
         "the user expect or desire a different method or outcome? If a relevant skill "
@@ -7934,6 +7936,8 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+        if self.platform == "juhe" and is_explicit_memory_request(original_user_message):
+            _should_review_memory = False
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}

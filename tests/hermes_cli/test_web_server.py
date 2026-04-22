@@ -308,6 +308,141 @@ class TestWebServerEndpoints:
             assert "FastAPI" not in resp.text  # Should not serve the actual source
 
 
+class TestJuheReadOnlyEndpoints:
+    FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "juhe"
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_TOKEN
+        self.client = TestClient(app)
+        self.client.headers["Authorization"] = f"Bearer {_SESSION_TOKEN}"
+
+    @staticmethod
+    def _seed_room_log(conversation_id: str, messages: list[dict]):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for item in messages:
+                db.append_room_message(
+                    platform="juhe",
+                    conversation_id=conversation_id,
+                    message_id=item.get("message_id"),
+                    appinfo=item.get("appinfo"),
+                    sender_id=item.get("sender_id"),
+                    sender_name=item.get("sender_name"),
+                    direction=item.get("direction", "inbound"),
+                    message_type=item.get("message_type", 2),
+                    text_preview=item.get("text_preview"),
+                    raw_payload=item.get("raw_payload"),
+                    created_at=item.get("created_at"),
+                    triggered=item.get("triggered", False),
+                    consumed_for_context=item.get("consumed_for_context", False),
+                    room_log_limit=500,
+                )
+        finally:
+            db.close()
+
+    @classmethod
+    def _load_juhe_fixture(cls, filename: str):
+        return json.loads((cls.FIXTURE_DIR / filename).read_text(encoding="utf-8"))
+
+    def test_get_juhe_conversations_returns_group_summaries_only(self):
+        from gateway.juhe_cache import JuheCacheStore
+
+        store = JuheCacheStore()
+        for room in self._load_juhe_fixture("rooms.json"):
+            store.upsert_room(room)
+
+        room_messages = self._load_juhe_fixture("room_messages.json")
+        self._seed_room_log("R:2001", room_messages["R:2001"])
+        self._seed_room_log("R:2002", room_messages["R:2002"])
+        self._seed_room_log("S:1001", room_messages["S:1001"])
+
+        resp = self.client.get("/api/juhe/conversations")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [item["conversation_id"] for item in data["conversations"]] == ["R:2002", "R:2001"]
+        assert [item["title"] for item in data["conversations"]] == ["Ops Group", "Dev Group"]
+        assert data["conversations"][0]["last_message_preview"] == "latest room message"
+        assert all(item["conversation_id"].startswith("R:") for item in data["conversations"])
+
+    def test_get_juhe_conversations_applies_query_filter(self):
+        from gateway.juhe_cache import JuheCacheStore
+
+        store = JuheCacheStore()
+        store.upsert_room({"room_id": "2001", "roomname": "Dev Group"})
+        store.upsert_room({"room_id": "2002", "roomname": "Sales Group"})
+
+        resp = self.client.get("/api/juhe/conversations", params={"query": "dev"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [item["conversation_id"] for item in data["conversations"]] == ["R:2001"]
+
+    def test_get_juhe_conversation_detail_returns_room_and_members(self):
+        from gateway.juhe_cache import JuheCacheStore
+        from gateway.juhe_room_memory import get_room_memory_path
+
+        store = JuheCacheStore()
+        room = self._load_juhe_fixture("rooms.json")[0]
+        store.upsert_room(room)
+        store.upsert_room_members("2001", room["members"])
+        memory_path = get_room_memory_path("R:2001")
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        memory_path.write_text("# MEMORY\n\n- 群内需求以最终确认版本为准。", encoding="utf-8")
+
+        resp = self.client.get("/api/juhe/conversations/R:2001")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["conversation"]["conversation_id"] == "R:2001"
+        assert data["conversation"]["title"] == "Dev Group"
+        assert data["conversation"]["member_count"] == 3
+        assert [item["nickname"] for item in data["members"]] == ["Alice", "Bob", "Carol"]
+        assert data["room_memory"]["exists"] is True
+        assert data["room_memory"]["path"].endswith("/memories/juhe/rooms/2001/MEMORY.md")
+        assert "最终确认版本" in data["room_memory"]["content"]
+
+    def test_get_juhe_conversation_detail_rejects_non_group_target(self):
+        resp = self.client.get("/api/juhe/conversations/S:1001")
+
+        assert resp.status_code == 404
+
+    def test_get_juhe_conversation_messages_supports_pagination_and_placeholder_mapping(self):
+        from gateway.juhe_cache import JuheCacheStore
+
+        store = JuheCacheStore()
+        store.upsert_room(self._load_juhe_fixture("rooms.json")[0])
+        room_messages = self._load_juhe_fixture("room_messages.json")
+        self._seed_room_log("R:2001", room_messages["R:2001"])
+
+        resp = self.client.get("/api/juhe/conversations/R:2001/messages", params={"limit": 2})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [item["id"] for item in data["messages"]] == ["msg-2", "msg-3"]
+        assert [item["preview"] for item in data["messages"]] == ["[图片] screenshot.png", "latest"]
+        assert data["messages"][0]["message_type_label"] == "图片"
+        assert data["messages"][0]["is_text"] is False
+        assert data["has_more"] is True
+
+        resp2 = self.client.get(
+            "/api/juhe/conversations/R:2001/messages",
+            params={"limit": 2, "before_message_id": "msg-2"},
+        )
+
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert [item["id"] for item in data2["messages"]] == ["msg-1"]
+
+
 # ---------------------------------------------------------------------------
 # _build_schema_from_config tests
 # ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES
+from gateway.platforms.base import BasePlatformAdapter, SUPPORTED_DOCUMENT_TYPES
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -451,8 +451,7 @@ class GatewayStreamConsumer:
         """
         if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
             return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
-        cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
+        _, cleaned = BasePlatformAdapter.extract_media(text)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         # Strip trailing whitespace/newlines but preserve leading content

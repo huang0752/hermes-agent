@@ -1653,6 +1653,11 @@ _VISION_AUTO_PROVIDER_ORDER = (
     "openrouter",
     "nous",
 )
+_VISION_TASK_NAMES = {"vision", "juhe_media", "juhe_media_fallback"}
+
+
+def _is_vision_task(task: Optional[str]) -> bool:
+    return str(task or "").strip().lower() in _VISION_TASK_NAMES
 
 
 def _normalize_vision_provider(provider: Optional[str]) -> str:
@@ -1707,6 +1712,7 @@ def resolve_vision_provider_client(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     *,
+    task: str = "vision",
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     async_mode: bool = False,
@@ -1719,7 +1725,7 @@ def resolve_vision_provider_client(
     stays conservative and only tries vision backends known to work today.
     """
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
+        task or "vision", provider, model, base_url, api_key
     )
     requested = _normalize_vision_provider(requested)
 
@@ -2302,10 +2308,11 @@ def call_llm(
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
 
-    if task == "vision":
+    if _is_vision_task(task):
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=provider,
             model=model,
+            task=task or "vision",
             base_url=base_url,
             api_key=api_key,
             async_mode=False,
@@ -2318,6 +2325,7 @@ def call_llm(
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto",
                 model=resolved_model,
+                task=task or "vision",
                 async_mode=False,
             )
         if client is None:
@@ -2510,10 +2518,11 @@ async def async_call_llm(
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
 
-    if task == "vision":
+    if _is_vision_task(task):
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=provider,
             model=model,
+            task=task or "vision",
             base_url=base_url,
             api_key=api_key,
             async_mode=True,
@@ -2526,6 +2535,7 @@ async def async_call_llm(
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto",
                 model=resolved_model,
+                task=task or "vision",
                 async_mode=True,
             )
         if client is None:
@@ -2561,6 +2571,19 @@ async def async_call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
+
+    # Mirror the sync path so async auxiliary calls expose the effective
+    # task/provider/model in logs. This is especially useful for Juhe media
+    # routing, where task-specific vision backends differ from the main model.
+    _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    if task:
+        logger.info(
+            "Auxiliary %s (async): using %s (%s)%s",
+            task,
+            resolved_provider or "auto",
+            final_model or "default",
+            f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "",
+        )
 
     kwargs = _build_call_kwargs(
         resolved_provider, final_model, messages,

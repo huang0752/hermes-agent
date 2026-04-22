@@ -59,6 +59,7 @@ from .config import (
     GatewayConfig,
     SessionResetPolicy,  # noqa: F401 — re-exported via gateway/__init__.py
     HomeChannel,
+    _coerce_bool,
 )
 
 
@@ -246,7 +247,10 @@ def build_session_context_prompt(
     # sender names are prefixed on each user message by the gateway.
     _is_shared_thread = (
         context.source.chat_type != "dm"
-        and context.source.thread_id
+        and (
+            bool(context.source.thread_id)
+            or bool(getattr(context.source, "shared_session", False))
+        )
     )
     if _is_shared_thread:
         lines.append(
@@ -566,13 +570,51 @@ class SessionStore:
             except OSError as e:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
+
+    def _resolve_session_isolation(self, source: SessionSource) -> tuple[bool, bool]:
+        """Resolve effective group/thread isolation flags for a source."""
+        group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
+        thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
+
+        platforms = getattr(self.config, "platforms", {}) or {}
+        platform_config = platforms.get(source.platform) if isinstance(platforms, dict) else None
+        platform_extra = getattr(platform_config, "extra", {}) if platform_config else {}
+        if not isinstance(platform_extra, dict):
+            platform_extra = {}
+
+        if source.platform == Platform.JUHE and "group_sessions_per_user" not in platform_extra:
+            group_sessions_per_user = False
+        elif "group_sessions_per_user" in platform_extra:
+            group_sessions_per_user = _coerce_bool(
+                platform_extra.get("group_sessions_per_user"),
+                group_sessions_per_user,
+            )
+
+        if "thread_sessions_per_user" in platform_extra:
+            thread_sessions_per_user = _coerce_bool(
+                platform_extra.get("thread_sessions_per_user"),
+                thread_sessions_per_user,
+            )
+
+        return group_sessions_per_user, thread_sessions_per_user
+
+    def _is_shared_session(self, source: SessionSource) -> bool:
+        """Return whether this source participates in a shared non-DM session."""
+        if source.chat_type == "dm":
+            return False
+        group_sessions_per_user, thread_sessions_per_user = self._resolve_session_isolation(source)
+        if source.thread_id:
+            return not thread_sessions_per_user
+        return not group_sessions_per_user
     
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
+        group_sessions_per_user, thread_sessions_per_user = self._resolve_session_isolation(source)
+
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
         )
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
@@ -749,6 +791,12 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "platform": source.platform.value,
+                "chat_id": source.chat_id,
+                "chat_type": source.chat_type,
+                "thread_id": source.thread_id,
+                "session_key": session_key,
+                "shared_session": self._is_shared_session(source),
             }
 
         # SQLite operations outside the lock
@@ -851,10 +899,17 @@ class SessionStore:
 
             self._entries[session_key] = new_entry
             self._save()
+            origin = old_entry.origin
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
-                "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "user_id": origin.user_id if origin else None,
+                "platform": old_entry.platform.value if old_entry.platform else None,
+                "chat_id": origin.chat_id if origin else None,
+                "chat_type": old_entry.chat_type,
+                "thread_id": origin.thread_id if origin else None,
+                "session_key": session_key,
+                "shared_session": self._is_shared_session(origin) if origin else False,
             }
 
         if self._db and db_end_session_id:

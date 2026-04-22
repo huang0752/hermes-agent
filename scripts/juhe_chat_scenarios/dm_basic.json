@@ -1,0 +1,40 @@
+{
+  "name": "dm-basic",
+  "description": "私聊消息直接进入私聊 session，可用来验证单聊基础链路。",
+  "mode": "gateway",
+  "env": {
+    "JUHE_HOME_CHANNEL": "S:1001"
+  },
+  "agent": {
+    "mode": "mock"
+  },
+  "adapter_extra": {
+    "app_key": "app-key",
+    "app_secret": "app-secret",
+    "guid": "guid-123",
+    "allow_from": [
+      "1001"
+    ]
+  },
+  "steps": [
+    {
+      "name": "dm hello",
+      "message": {
+        "sender": "1001",
+        "sender_name": "员工A",
+        "id": "dm-msg-1",
+        "content": "hello juhe"
+      },
+      "agent": {
+        "final_response": "收到，这是一条 Juhe 私聊完整链路测试回复。"
+      },
+      "expect": {
+        "dispatched": true,
+        "agent_called": true,
+        "session_key": "agent:main:juhe:dm:S:1001",
+        "outbound_count": 1,
+        "final_response_contains": "完整链路测试回复"
+      }
+    }
+  ]
+}

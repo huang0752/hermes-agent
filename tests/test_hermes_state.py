@@ -83,6 +83,27 @@ class TestSessionLifecycle:
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
 
+    def test_create_session_persists_gateway_metadata(self, db):
+        db.create_session(
+            session_id="juhe-room-session",
+            source="juhe",
+            user_id="1001",
+            platform="juhe",
+            chat_id="R:2001",
+            chat_type="group",
+            thread_id=None,
+            session_key="agent:main:juhe:group:R:2001",
+            shared_session=True,
+        )
+
+        session = db.get_session("juhe-room-session")
+        assert session["platform"] == "juhe"
+        assert session["chat_id"] == "R:2001"
+        assert session["chat_type"] == "group"
+        assert session["thread_id"] is None
+        assert session["session_key"] == "agent:main:juhe:group:R:2001"
+        assert session["shared_session"] == 1
+
 
 # =========================================================================
 # Message storage
@@ -278,6 +299,335 @@ class TestFTS5Search:
         # At least one result should mention docker
         snippets = [r.get("snippet", "") for r in results]
         assert any("docker" in s.lower() or "Docker" in s for s in snippets)
+
+
+class TestJuheRoomMessageLog:
+    def test_append_room_message_trims_per_room(self, db):
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:room-a",
+            message_id="a-1",
+            sender_id="1001",
+            sender_name="Alice",
+            direction="inbound",
+            message_type=2,
+            text_preview="first",
+            raw_payload={"text": "first"},
+            triggered=False,
+            consumed_for_context=False,
+            room_log_limit=2,
+        )
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:room-a",
+            message_id="a-2",
+            sender_id="1001",
+            sender_name="Alice",
+            direction="inbound",
+            message_type=2,
+            text_preview="second",
+            raw_payload={"text": "second"},
+            triggered=False,
+            consumed_for_context=False,
+            room_log_limit=2,
+        )
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:room-a",
+            message_id="a-3",
+            sender_id="1001",
+            sender_name="Alice",
+            direction="inbound",
+            message_type=2,
+            text_preview="third",
+            raw_payload={"text": "third"},
+            triggered=False,
+            consumed_for_context=False,
+            room_log_limit=2,
+        )
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:room-b",
+            message_id="b-1",
+            sender_id="1002",
+            sender_name="Bob",
+            direction="inbound",
+            message_type=2,
+            text_preview="other room",
+            raw_payload={"text": "other room"},
+            triggered=False,
+            consumed_for_context=False,
+            room_log_limit=2,
+        )
+
+        room_a = db.get_room_history("juhe", "R:room-a", limit=10)
+        room_b = db.get_room_history("juhe", "R:room-b", limit=10)
+
+        assert [item["message_id"] for item in room_a] == ["a-2", "a-3"]
+        assert [item["message_id"] for item in room_b] == ["b-1"]
+
+    def test_get_unconsumed_room_messages_marks_consumed_and_supports_history_cursor(self, db):
+        for index, text in enumerate(("first", "second", "third"), start=1):
+            db.append_room_message(
+                platform="juhe",
+                conversation_id="R:2001",
+                message_id=f"msg-{index}",
+                sender_id="1001",
+                sender_name="Alice",
+                direction="inbound",
+                message_type=2,
+                text_preview=text,
+                raw_payload={"text": text},
+                triggered=False,
+                consumed_for_context=False,
+                room_log_limit=500,
+            )
+
+        pending = db.get_unconsumed_room_messages(
+            "juhe",
+            "R:2001",
+            limit=2,
+            char_limit=4000,
+        )
+        assert [item["message_id"] for item in pending] == ["msg-2", "msg-3"]
+
+        db.mark_room_messages_consumed("juhe", "R:2001", [item["id"] for item in pending])
+
+        remaining = db.get_unconsumed_room_messages(
+            "juhe",
+            "R:2001",
+            limit=5,
+            char_limit=4000,
+        )
+        assert [item["message_id"] for item in remaining] == ["msg-1"]
+
+        older = db.get_room_history("juhe", "R:2001", before_message_id="msg-3", limit=2)
+        assert [item["message_id"] for item in older] == ["msg-1", "msg-2"]
+
+    def test_search_room_history_matches_phrase_keywords_and_substring_fallback(self, db):
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:2001",
+            message_id="msg-1",
+            sender_id="1001",
+            sender_name="Alice",
+            direction="inbound",
+            message_type=2,
+            text_preview="品牌 logo 需要换成客户提供的正式版本",
+            raw_payload={"text": "品牌 logo 需要换成客户提供的正式版本"},
+            room_log_limit=500,
+        )
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:2001",
+            message_id="msg-2",
+            sender_id="1002",
+            sender_name="Bob",
+            direction="inbound",
+            message_type=2,
+            text_preview="第二个是品牌 logo，第一个是证书 logo",
+            raw_payload={"text": "第二个是品牌 logo，第一个是证书 logo"},
+            room_log_limit=500,
+        )
+        db.append_room_message(
+            platform="juhe",
+            conversation_id="R:3001",
+            message_id="msg-3",
+            sender_id="2001",
+            sender_name="Carol",
+            direction="inbound",
+            message_type=2,
+            text_preview="logo 资源已经上传到另外一个群",
+            raw_payload={"text": "logo 资源已经上传到另外一个群"},
+            room_log_limit=500,
+        )
+
+        phrase_hits = db.search_room_history("juhe", "R:2001", query="品牌 logo", limit=5)
+        assert [item["message_id"] for item in phrase_hits] == ["msg-2", "msg-1"]
+
+        keyword_hits = db.search_room_history(
+            "juhe",
+            "R:2001",
+            query="logo 素材 图标 图片 resource",
+            limit=5,
+        )
+        assert [item["message_id"] for item in keyword_hits] == ["msg-2", "msg-1"]
+
+        fallback_hits = db.search_room_history("juhe", "R:2001", query="证书 logo", limit=5)
+        assert fallback_hits[0]["message_id"] == "msg-2"
+        assert all(item["message_id"] != "msg-3" for item in fallback_hits)
+
+    def test_search_prior_session_messages_filters_to_same_juhe_room(self, db):
+        db.create_session(
+            session_id="s-current",
+            source="juhe",
+            platform="juhe",
+            chat_id="R:2001",
+            chat_type="group",
+            session_key="agent:main:juhe:group:R:2001",
+            shared_session=True,
+        )
+        db.create_session(
+            session_id="s-prior-hit",
+            source="juhe",
+            platform="juhe",
+            chat_id="R:2001",
+            chat_type="group",
+            session_key="agent:main:juhe:group:R:2001",
+            shared_session=True,
+        )
+        db.create_session(
+            session_id="s-prior-other-room",
+            source="juhe",
+            platform="juhe",
+            chat_id="R:3001",
+            chat_type="group",
+            session_key="agent:main:juhe:group:R:3001",
+            shared_session=True,
+        )
+        db.create_session(
+            session_id="s-legacy-missing-meta",
+            source="juhe",
+        )
+
+        db.append_message("s-prior-hit", role="user", content="logo 要按客户发来的蓝底版本处理")
+        db.append_message("s-prior-hit", role="assistant", content="收到，后续都按蓝底品牌 logo 处理。")
+        db.append_message("s-prior-other-room", role="assistant", content="另一个群也讨论了 logo。")
+        db.append_message("s-legacy-missing-meta", role="assistant", content="没有元数据的旧会话也提到了 logo。")
+
+        hits = db.search_prior_session_messages(
+            platform="juhe",
+            chat_id="R:2001",
+            chat_type="group",
+            exclude_session_id="s-current",
+            query="logo",
+            limit=5,
+        )
+
+        assert [item["session_id"] for item in hits] == ["s-prior-hit", "s-prior-hit"]
+        assert [item["role"] for item in hits] == ["assistant", "user"]
+
+    def test_juhe_attachment_parse_cache_round_trip_prefers_bucket_key(self, db):
+        cache_id = db.upsert_juhe_attachment_parse_cache(
+            platform="juhe",
+            bucket="wework",
+            object_key="wwcdn/private/license.pdf",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/private/license.pdf",
+            file_id="file-license",
+            file_md5="md5-license",
+            media_type="application/pdf",
+            file_name="license.pdf",
+            parser="dashscope_doc_url",
+            extracted_text="识别出的 PDF 内容",
+        )
+
+        assert cache_id > 0
+
+        cached = db.get_juhe_attachment_parse_cache(
+            platform="juhe",
+            bucket="wework",
+            object_key="wwcdn/private/license.pdf",
+        )
+
+        assert cached is not None
+        assert cached["identity_kind"] == "bucket_key"
+        assert cached["identity_value"] == "wework/wwcdn/private/license.pdf"
+        assert cached["parser"] == "dashscope_doc_url"
+        assert cached["extracted_text"] == "识别出的 PDF 内容"
+
+    def test_juhe_attachment_parse_cache_normalizes_object_url_queries(self, db):
+        db.upsert_juhe_attachment_parse_cache(
+            platform="juhe",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/private/license.pdf?X-Amz-Signature=1",
+            media_type="application/pdf",
+            file_name="license.pdf",
+            parser="dashscope_doc_url",
+            extracted_text="URL 归一化命中",
+        )
+
+        cached = db.get_juhe_attachment_parse_cache(
+            platform="juhe",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/private/license.pdf?X-Amz-Signature=2",
+        )
+
+        assert cached is not None
+        assert cached["identity_kind"] == "object_url"
+        assert cached["extracted_text"] == "URL 归一化命中"
+
+    def test_juhe_attachment_parse_cache_falls_back_to_file_id_and_md5(self, db):
+        db.upsert_juhe_attachment_parse_cache(
+            platform="juhe",
+            file_id="file-license",
+            file_md5="md5-license",
+            media_type="application/pdf",
+            file_name="license.pdf",
+            parser="dashscope_doc_url",
+            extracted_text="file_id + md5 命中",
+        )
+
+        cached = db.get_juhe_attachment_parse_cache(
+            platform="juhe",
+            file_id="file-license",
+            file_md5="md5-license",
+        )
+
+        assert cached is not None
+        assert cached["identity_kind"] == "file_id_md5"
+        assert cached["extracted_text"] == "file_id + md5 命中"
+
+    def test_juhe_attachment_parse_cache_persists_status_description_and_kind(self, db):
+        cache_id = db.upsert_juhe_attachment_parse_cache(
+            platform="juhe",
+            bucket="wework",
+            object_key="wwcdn/private/license.jpg",
+            media_type="image/jpeg",
+            file_name="license.jpg",
+            parser="vision_preheat",
+            extracted_text="营业执照 OCR 内容",
+            content_kind="image",
+            content_format="vision",
+            display_description="图片 license.jpg：营业执照 OCR 内容",
+            parse_status="success",
+        )
+
+        assert cache_id > 0
+
+        cached = db.get_juhe_attachment_parse_cache(
+            platform="juhe",
+            bucket="wework",
+            object_key="wwcdn/private/license.jpg",
+        )
+
+        assert cached is not None
+        assert cached["content_kind"] == "image"
+        assert cached["content_format"] == "vision"
+        assert cached["display_description"] == "图片 license.jpg：营业执照 OCR 内容"
+        assert cached["parse_status"] == "success"
+        assert cached["error_message"] is None
+
+    def test_juhe_attachment_parse_cache_allows_pending_records_without_extracted_text(self, db):
+        db.upsert_juhe_attachment_parse_cache(
+            platform="juhe",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
+            media_type="application/pdf",
+            file_name="report.pdf",
+            parser="preheat_queue",
+            extracted_text="",
+            content_kind="document",
+            content_format="markdown",
+            display_description="文件 report.pdf：已收到，后台正在解析",
+            parse_status="pending",
+        )
+
+        cached = db.get_juhe_attachment_parse_cache(
+            platform="juhe",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf?X-Amz-Signature=1",
+        )
+
+        assert cached is not None
+        assert cached["parse_status"] == "pending"
+        assert cached["display_description"] == "文件 report.pdf：已收到，后台正在解析"
+        assert cached["extracted_text"] == ""
 
     def test_search_empty_query(self, db):
         assert db.search_messages("") == []
@@ -928,14 +1278,16 @@ class TestSchemaInit:
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
         tables = {row[0] for row in cursor.fetchall()}
+        assert "juhe_attachment_parse_cache" in tables
         assert "sessions" in tables
         assert "messages" in tables
+        assert "room_messages" in tables
         assert "schema_version" in tables
 
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 10
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -991,17 +1343,19 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v10
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 10
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
         assert session is not None
         assert session["title"] is None
+        assert session["platform"] is None
+        assert session["chat_id"] is None
 
         # Verify we can set title on migrated session
         assert migrated_db.set_session_title("existing", "Migrated Title") is True

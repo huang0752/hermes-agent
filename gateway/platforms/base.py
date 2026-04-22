@@ -16,7 +16,7 @@ import subprocess
 import sys
 import uuid
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +285,38 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     if max_len <= 3:
         return "." * max_len
     return f"{safe[:max_len - 3]}..."
+
+
+def media_reference_suffix(value: str) -> str:
+    """Return a lowercase suffix for local paths or HTTP URLs.
+
+    Remote media references often carry query parameters (for example signed
+    object-store URLs). Routing and logging should look at the URL path, not at
+    the query string, otherwise ``.zip?Signature=...`` stops matching the real
+    file type.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    try:
+        parsed = urlsplit(text)
+    except Exception:
+        parsed = None
+
+    if parsed and parsed.scheme and parsed.netloc:
+        return Path(unquote(parsed.path or "")).suffix.lower()
+    return Path(text).suffix.lower()
+
+
+def _is_supported_media_reference(value: str, allowed_exts: tuple[str, ...]) -> bool:
+    """Return True when value looks like a deliverable local path or HTTP(S) URL."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if not text.startswith(("http://", "https://", "/", "~/")):
+        return False
+    return media_reference_suffix(text) in allowed_exts
 
 
 async def _ssrf_redirect_guard(response):
@@ -566,7 +598,9 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".txt": "text/plain",
     ".log": "text/plain",
     ".zip": "application/zip",
+    ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
@@ -671,7 +705,9 @@ class MessageEvent:
     message_id: Optional[str] = None
     
     # Media attachments
-    # media_urls: local file paths (for vision tool access)
+    # media_urls: media references suitable for downstream preprocessing.
+    # Many platforms use local file paths, while Juhe may provide non-sensitive
+    # attachment refs and keep real signed access URLs in adapter-private fields.
     media_urls: List[str] = field(default_factory=list)
     media_types: List[str] = field(default_factory=list)
     
@@ -744,6 +780,24 @@ def merge_pending_message_event(
         and getattr(existing, "message_type", None) == MessageType.PHOTO
         and event.message_type == MessageType.PHOTO
     ):
+        existing_media_count = len(existing.media_urls)
+        incoming_media_count = len(event.media_urls)
+
+        def merge_parallel_attr(attr_name: str, filler: Any) -> None:
+            existing_values = list(getattr(existing, attr_name, []) or [])
+            incoming_values = list(getattr(event, attr_name, []) or [])
+            if not existing_values and not incoming_values:
+                return
+            while len(existing_values) < existing_media_count:
+                existing_values.append(filler.copy() if isinstance(filler, dict) else filler)
+            while len(incoming_values) < incoming_media_count:
+                incoming_values.append(filler.copy() if isinstance(filler, dict) else filler)
+            existing_values.extend(incoming_values)
+            setattr(existing, attr_name, existing_values)
+
+        merge_parallel_attr("_juhe_media_access_urls", "")
+        merge_parallel_attr("_juhe_attachment_identities", {})
+        merge_parallel_attr("_juhe_media_descriptions", "")
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
         if event.text:
@@ -809,9 +863,21 @@ class BasePlatformAdapter(ABC):
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Chats where auto-TTS on voice input is disabled (set by /voice off)
         self._auto_tts_disabled_chats: set = set()
+        # Global kill-switch mirrored from gateway voice.auto_tts config.
+        self._auto_tts_globally_disabled: bool = False
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+
+    def _prefers_document_delivery_before_text(self) -> bool:
+        """Whether document attachments should be delivered before text."""
+        return self.platform == Platform.JUHE
+
+    def _document_delivery_failure_text(self) -> str:
+        """User-facing message when a document attachment could not be delivered."""
+        if self.platform == Platform.JUHE:
+            return "最终文件发送失败，请稍后重试。"
+        return "Document delivery failed. Please try again."
 
     @property
     def has_fatal_error(self) -> bool:
@@ -1229,7 +1295,7 @@ class BasePlatformAdapter(ABC):
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-            if path:
+            if _is_supported_media_reference(path, media_tag_exts):
                 media.append((path, has_voice_tag))
 
         # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
@@ -1659,6 +1725,7 @@ class BasePlatformAdapter(ABC):
                 if (event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
+                        and not getattr(self, "_auto_tts_globally_disabled", False)
                         and event.source.chat_id not in self._auto_tts_disabled_chats):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
@@ -1689,8 +1756,112 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
+                # Human-like pacing delay between text and media
+                human_delay = self._get_human_delay()
+
+                # Send extracted media files — route by file type
+                _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
+                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+                async def _send_media_reference(media_path: str, is_voice: bool = False):
+                    ext = media_reference_suffix(media_path)
+                    if ext in _AUDIO_EXTS:
+                        return await self.send_voice(
+                            chat_id=event.source.chat_id,
+                            audio_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    if ext in _VIDEO_EXTS:
+                        return await self.send_video(
+                            chat_id=event.source.chat_id,
+                            video_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    if ext in _IMAGE_EXTS:
+                        return await self.send_image_file(
+                            chat_id=event.source.chat_id,
+                            image_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    return await self.send_document(
+                        chat_id=event.source.chat_id,
+                        file_path=media_path,
+                        metadata=_thread_metadata,
+                    )
+
+                pre_text_media_files: list[tuple[str, bool]] = []
+                post_text_media_files: list[tuple[str, bool]] = []
+                pre_text_local_files: list[str] = []
+                post_text_local_files: list[str] = []
+
+                if self._prefers_document_delivery_before_text():
+                    for media_path, is_voice in media_files:
+                        ext = media_reference_suffix(media_path)
+                        if ext and ext not in _AUDIO_EXTS and ext not in _VIDEO_EXTS and ext not in _IMAGE_EXTS:
+                            pre_text_media_files.append((media_path, is_voice))
+                        else:
+                            post_text_media_files.append((media_path, is_voice))
+                    for file_path in local_files:
+                        ext = media_reference_suffix(file_path)
+                        if ext and ext not in _AUDIO_EXTS and ext not in _VIDEO_EXTS and ext not in _IMAGE_EXTS:
+                            pre_text_local_files.append(file_path)
+                        else:
+                            post_text_local_files.append(file_path)
+                else:
+                    post_text_media_files = list(media_files)
+                    post_text_local_files = list(local_files)
+
+                document_delivery_failed = False
+                for media_path, is_voice in pre_text_media_files:
+                    if human_delay > 0:
+                        await asyncio.sleep(human_delay)
+                    try:
+                        media_result = await _send_media_reference(media_path, is_voice=is_voice)
+                        _record_delivery(media_result)
+                        if not media_result.success:
+                            logger.warning("[%s] Failed to send pre-text document media (%s): %s", self.name, media_reference_suffix(media_path), media_result.error)
+                            document_delivery_failed = True
+                            break
+                    except Exception as media_err:
+                        logger.warning("[%s] Error sending pre-text media: %s", self.name, media_err)
+                        document_delivery_failed = True
+                        break
+
+                if not document_delivery_failed:
+                    for file_path in pre_text_local_files:
+                        if human_delay > 0:
+                            await asyncio.sleep(human_delay)
+                        try:
+                            file_result = await _send_media_reference(file_path)
+                            _record_delivery(file_result)
+                            if not file_result.success:
+                                logger.warning("[%s] Failed to send pre-text local document (%s): %s", self.name, file_path, file_result.error)
+                                document_delivery_failed = True
+                                break
+                        except Exception as file_err:
+                            logger.error("[%s] Error sending pre-text local file %s: %s", self.name, file_path, file_err)
+                            document_delivery_failed = True
+                            break
+
+                if document_delivery_failed:
+                    failure_text = self._document_delivery_failure_text()
+                    if failure_text:
+                        setattr(event, "_final_response_text", failure_text)
+                        result = await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=failure_text,
+                            reply_to=event.message_id,
+                            metadata=_thread_metadata,
+                        )
+                        _record_delivery(result)
+                    text_content = ""
+                    images = []
+                    post_text_media_files = []
+                    post_text_local_files = []
+
                 # Send the text portion
                 if text_content:
+                    setattr(event, "_final_response_text", text_content)
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
@@ -1699,9 +1870,6 @@ class BasePlatformAdapter(ABC):
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)
-
-                # Human-like pacing delay between text and media
-                human_delay = self._get_human_delay()
 
                 # Send extracted images as native attachments
                 if images:
@@ -1731,78 +1899,33 @@ class BasePlatformAdapter(ABC):
                                 caption=alt_text if alt_text else None,
                                 metadata=_thread_metadata,
                             )
+                        _record_delivery(img_result)
                         if not img_result.success:
                             logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                     except Exception as img_err:
                         logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
 
                 # Send extracted media files — route by file type
-                _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
-                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-
-                for media_path, is_voice in media_files:
+                for media_path, is_voice in post_text_media_files:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        ext = Path(media_path).suffix.lower()
-                        if ext in _AUDIO_EXTS:
-                            media_result = await self.send_voice(
-                                chat_id=event.source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif ext in _VIDEO_EXTS:
-                            media_result = await self.send_video(
-                                chat_id=event.source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif ext in _IMAGE_EXTS:
-                            media_result = await self.send_image_file(
-                                chat_id=event.source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            media_result = await self.send_document(
-                                chat_id=event.source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-
+                        media_result = await _send_media_reference(media_path, is_voice=is_voice)
+                        _record_delivery(media_result)
                         if not media_result.success:
-                            logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            logger.warning("[%s] Failed to send media (%s): %s", self.name, media_reference_suffix(media_path), media_result.error)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local files as native attachments
-                for file_path in local_files:
+                for file_path in post_text_local_files:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        ext = Path(file_path).suffix.lower()
-                        if ext in _IMAGE_EXTS:
-                            await self.send_image_file(
-                                chat_id=event.source.chat_id,
-                                image_path=file_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif ext in _VIDEO_EXTS:
-                            await self.send_video(
-                                chat_id=event.source.chat_id,
-                                video_path=file_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await self.send_document(
-                                chat_id=event.source.chat_id,
-                                file_path=file_path,
-                                metadata=_thread_metadata,
-                            )
+                        file_result = await _send_media_reference(file_path)
+                        _record_delivery(file_result)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
-
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             await self._run_processing_hook(

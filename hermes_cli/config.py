@@ -446,6 +446,20 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },
+        "juhe_media": {
+            "provider": "auto",    # URL-native Juhe image parsing primary backend
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+        },
+        "juhe_media_fallback": {
+            "provider": "",        # optional dedicated fallback backend for Juhe media parsing
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+        },
         "web_extract": {
             "provider": "auto",
             "model": "",
@@ -708,7 +722,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 18,
 }
 
 # =============================================================================

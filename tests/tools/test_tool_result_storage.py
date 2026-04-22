@@ -1,5 +1,6 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
+import json
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -205,6 +206,43 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    def test_certificate_render_job_result_keeps_download_url_for_delivery_pipeline(self):
+        url = (
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=minioadmin&Signature=abc"
+        )
+        content = json.dumps(
+            {
+                "result": json.dumps(
+                    {
+                        "status": "completed",
+                        "job_id": 92,
+                        "download_url": url,
+                        "progress": {"output_url": url},
+                    }
+                ),
+                "structuredContent": {
+                    "status": "completed",
+                    "job_id": 92,
+                    "download_url": url,
+                    "progress": {"output_url": url},
+                },
+            },
+            ensure_ascii=False,
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="mcp_local_create_render_job_and_wait",
+            tool_use_id="tc_render_job",
+            env=None,
+            threshold=50_000,
+        )
+
+        assert '"download_url"' in result
+        assert url in result
+        assert "Do not use terminal, curl, wget" not in result
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(

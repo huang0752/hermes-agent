@@ -1,6 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
 from tools.registry import ToolRegistry
+from toolsets import _HERMES_CORE_TOOLS
 from toolsets import (
     TOOLSETS,
     get_toolset,
@@ -204,6 +205,9 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_certificate_workflow_tool_is_in_hermes_core_tools(self):
+        assert "certificate_workflow_tool" in _HERMES_CORE_TOOLS
 
 
 class TestPluginToolsets:

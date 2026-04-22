@@ -23,6 +23,18 @@ auxiliary:
     api_key: ""
     timeout: 120
     download_timeout: 30
+  juhe_media:
+    provider: auto
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 120
+  juhe_media_fallback:
+    provider: ""
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 120
 
 stt:
   enabled: false
@@ -55,6 +67,26 @@ platforms:
       group_policy: allowlist
       group_allow_from:
         - "R:REPLACE_WITH_ALLOWED_GROUP"
+      group_sessions_per_user: false
+      trigger_user_ids:
+        - "S:REPLACE_WITH_TRIGGER_USER"
+      room_log_limit: 500
+      pending_context_limit: 20
+      room_memory_char_limit: 2400
+      room_recall_enabled: true
+      room_recall_hit_limit: 4
+      prior_session_recall_hit_limit: 4
+      room_recall_char_limit: 1600
+      history_question_patterns:
+        - "之前"
+        - "以前"
+        - "上次"
+        - "刚才"
+        - "有没有说过"
+        - "还记得"
+        - "是否聊过"
+        - "那个"
+        - "重新"
 
       # Inbound attachment handling.
       inbound_attachment_max_bytes: 20971520
@@ -67,6 +99,7 @@ platforms:
       inbound_s3_secret_key: "${JUHE_INBOUND_S3_SECRET_KEY}"
       inbound_s3_use_https: false
       inbound_s3_addressing_style: path
+      inbound_s3_url_expires_seconds: 3600
 
       # Temporary object storage for outbound Juhe uploads (optional).
       temp_s3_endpoint_url: "${JUHE_S3_ENDPOINT_URL}"

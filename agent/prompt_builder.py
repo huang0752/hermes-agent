@@ -336,12 +336,14 @@ PLATFORM_HINTS = {
     "juhe": (
         "You are communicating through Juhe, an enterprise WeChat bridge. "
         "Use plain text formatting and avoid markdown-specific rendering assumptions. "
-        "Juhe can send file attachments from externally reachable HTTP(S) URLs: "
-        "include MEDIA:https://... in your response when you need to deliver a "
-        "document, image, audio clip, or video. If temporary object storage is "
-        "configured, local MEDIA:/absolute/path files can be staged automatically "
-        "and sent through Juhe as well. Without that staging configuration, "
-        "Juhe's upload API cannot read local filesystem paths directly."
+        "For normal native delivery, include MEDIA:/absolute/path/to/file in your "
+        "response so Hermes can stage and send the local artifact. Use "
+        "`certificate_workflow_tool` as the standard execution surface for "
+        "certificate delivery, and only deliver the wrapper-provided local artifact. "
+        "Do not expose or send raw certificate render-job download URLs or "
+        "HTTP(S)-based MEDIA links for certificate packages. Do not improvise "
+        "manual delivery workarounds with terminal, curl, wget, Python download "
+        "scripts, or ad-hoc remote-link forwarding."
     ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "

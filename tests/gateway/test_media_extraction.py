@@ -7,8 +7,16 @@ This prevents voice messages from accumulating and being sent multiple
 times per reply. (Regression test for #160)
 """
 
-import pytest
+import json
 import re
+
+import pytest
+
+from gateway.run import (
+    _augment_final_response_with_tool_media,
+    _collect_tool_result_media_tags,
+)
+from gateway.platforms.base import BasePlatformAdapter
 
 
 def extract_media_tags_fixed(result_messages, history_len):
@@ -178,6 +186,249 @@ class TestMediaExtraction:
         seen = set()
         unique = [t for t in tags if t not in seen and not seen.add(t)]
         assert len(unique) == 2  # After dedup: same.ogg and different.ogg
+
+
+class TestStructuredDeliveryUrlExtraction:
+    """Tests for structured tool results that expose file delivery URLs."""
+
+    def test_collects_download_url_from_tool_json(self):
+        """Structured download_url values should be promoted to MEDIA tags."""
+        url = "http://example.com/files/archive.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "1",
+                "content": json.dumps({"success": True, "job_id": 91, "download_url": url}),
+            }
+        ]
+
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(messages, set())
+
+        assert tags == [f"MEDIA:{url}"]
+        assert voice_directive is False
+        assert raw_urls == [url]
+
+    def test_collects_nested_output_url_from_structured_content(self):
+        """Nested structuredContent output_url values should also be promoted."""
+        url = "https://example.com/render/output/report.pdf?token=secret"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "2",
+                "content": "render complete",
+                "structuredContent": {
+                    "success": True,
+                    "delivery": {"output_url": url},
+                },
+            }
+        ]
+
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(messages, set())
+
+        assert tags == [f"MEDIA:{url}"]
+        assert voice_directive is False
+        assert raw_urls == [url]
+
+    def test_certificate_render_job_download_url_stays_internal(self):
+        """Certificate render-job URLs should be stripped from visible text, not promoted to MEDIA."""
+        url = (
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+        )
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "cert-job",
+                "content": json.dumps({"success": True, "download_url": url}),
+            }
+        ]
+
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(messages, set())
+
+        assert tags == []
+        assert voice_directive is False
+        assert raw_urls == [url]
+
+    def test_certificate_render_job_download_url_promotes_to_media_for_juhe_delivery(self):
+        """Juhe delivery should promote certificate render-job URLs into MEDIA tags."""
+        url = (
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+        )
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "cert-job-juhe",
+                "content": json.dumps({"success": True, "download_url": url}),
+            }
+        ]
+
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(
+            messages,
+            set(),
+            allow_certificate_render_media=True,
+        )
+
+        assert tags == [f"MEDIA:{url}"]
+        assert voice_directive is False
+        assert raw_urls == [url]
+
+    def test_prefers_local_delivery_artifact_over_remote_download_url(self):
+        """When a tool result contains a local delivery artifact, remote links stay internal."""
+        url = "https://example.com/render/output/report.zip?token=secret"
+        local_path = "/tmp/certificate-delivery/report.zip"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "local-first",
+                "content": json.dumps(
+                    {
+                        "mode": "execute",
+                        "delivery": {
+                            "local_path": local_path,
+                            "media_tag": f"MEDIA:{local_path}",
+                        },
+                        "execution": {
+                            "render_job": {
+                                "download_url": url,
+                            }
+                        },
+                    }
+                ),
+            }
+        ]
+
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(messages, set())
+
+        assert tags == [f"MEDIA:{local_path}"]
+        assert voice_directive is False
+        assert raw_urls == []
+
+    def test_prefers_local_artifact_even_when_juhe_remote_promotion_is_enabled(self):
+        """Juhe remote-url promotion must not override explicit local delivery artifacts."""
+        url = (
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+        )
+        local_path = "/tmp/certificate-delivery/certificates.zip"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "local-preferred-juhe",
+                "content": json.dumps(
+                    {
+                        "delivery": {
+                            "local_path": local_path,
+                            "media_tag": f"MEDIA:{local_path}",
+                            "download_url": url,
+                        }
+                    }
+                ),
+            }
+        ]
+
+        tags, voice_directive, raw_urls = _collect_tool_result_media_tags(
+            messages,
+            set(),
+            allow_certificate_render_media=True,
+        )
+
+        assert tags == [f"MEDIA:{local_path}"]
+        assert voice_directive is False
+        assert raw_urls == []
+
+    def test_augment_final_response_strips_raw_download_link_and_appends_media(self):
+        """Visible text should not retain a raw delivery URL once MEDIA is synthesized."""
+        url = "http://example.com/certificates/job-91/archive.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "3",
+                "content": json.dumps({"success": True, "download_url": url}),
+            }
+        ]
+
+        final_response = f"压缩包已生成。\n下载链接：{url}"
+
+        augmented = _augment_final_response_with_tool_media(final_response, messages, set())
+        _, visible_text = BasePlatformAdapter.extract_media(augmented)
+
+        assert "下载链接" not in visible_text
+        assert url not in visible_text
+        assert "压缩包已生成。" in visible_text
+        assert f"MEDIA:{url}" in augmented
+
+    def test_augment_final_response_strips_certificate_render_job_link_without_media(self):
+        """Certificate render-job links should be removed from visible text without becoming MEDIA."""
+        url = (
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+            "2026/04/22/job-92/certificates.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+        )
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "cert-job-visible",
+                "content": json.dumps({"success": True, "download_url": url}),
+            }
+        ]
+
+        final_response = f"压缩包已生成。\n下载链接：{url}"
+
+        augmented = _augment_final_response_with_tool_media(final_response, messages, set())
+        _, visible_text = BasePlatformAdapter.extract_media(augmented)
+
+        assert "下载链接" not in visible_text
+        assert url not in visible_text
+        assert "压缩包已生成。" in visible_text
+        assert f"MEDIA:{url}" not in augmented
+
+    def test_augment_final_response_appends_missing_media_even_if_media_already_present(self):
+        """Existing MEDIA tags in the reply should not suppress new tool-result delivery media."""
+        url = "https://example.com/results/final-bundle.zip?token=abc"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "4",
+                "content": json.dumps({"success": True, "download_url": url}),
+            }
+        ]
+
+        final_response = "语音已生成。\n[[audio_as_voice]]\nMEDIA:/tmp/voice.ogg"
+
+        augmented = _augment_final_response_with_tool_media(final_response, messages, set())
+
+        assert "MEDIA:/tmp/voice.ogg" in augmented
+        assert f"MEDIA:{url}" in augmented
+
+    def test_augment_final_response_strips_local_delivery_paths_from_visible_text(self):
+        """Local artifact paths from tool results should not leak into visible assistant text."""
+        local_path = "/tmp/certificate-delivery/final-package.zip"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "local-path-1",
+                "content": json.dumps(
+                    {
+                        "mode": "execute",
+                        "delivery": {
+                            "filename": "final-package.zip",
+                            "local_path": local_path,
+                            "media_tag": f"MEDIA:{local_path}",
+                        },
+                    }
+                ),
+            }
+        ]
+
+        final_response = f"压缩包已生成。\n本地路径：{local_path}\n请查收。"
+        augmented = _augment_final_response_with_tool_media(final_response, messages, set())
+        _, visible_text = BasePlatformAdapter.extract_media(augmented)
+
+        assert local_path not in visible_text
+        assert "本地路径" not in visible_text
+        assert "压缩包已生成。" in visible_text
+        assert "请查收。" in visible_text
+        assert f"MEDIA:{local_path}" in augmented
 
 
 if __name__ == "__main__":

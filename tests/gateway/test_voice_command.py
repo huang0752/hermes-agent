@@ -77,6 +77,7 @@ def _make_runner(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
+    runner._voice_auto_tts_enabled = True
     runner._VOICE_MODE_PATH = tmp_path / "gateway_voice_mode.json"
     runner._session_db = None
     runner.session_store = MagicMock()
@@ -167,11 +168,20 @@ class TestHandleVoiceCommand:
 
     def test_sync_voice_mode_state_to_adapter_restores_off_chats(self, runner):
         runner._voice_mode = {"123": "off", "456": "all"}
-        adapter = SimpleNamespace(_auto_tts_disabled_chats=set())
+        adapter = SimpleNamespace(_auto_tts_disabled_chats=set(), _auto_tts_globally_disabled=False)
 
         runner._sync_voice_mode_state_to_adapter(adapter)
 
         assert adapter._auto_tts_disabled_chats == {"123"}
+        assert adapter._auto_tts_globally_disabled is False
+
+    def test_sync_voice_mode_state_to_adapter_honors_global_auto_tts_off(self, runner):
+        runner._voice_auto_tts_enabled = False
+        adapter = SimpleNamespace(_auto_tts_disabled_chats=set(), _auto_tts_globally_disabled=False)
+
+        runner._sync_voice_mode_state_to_adapter(adapter)
+
+        assert adapter._auto_tts_globally_disabled is True
 
     def test_restart_restores_voice_off_state(self, runner, tmp_path):
         runner._VOICE_MODE_PATH.write_text(json.dumps({"123": "off"}))
@@ -292,6 +302,10 @@ class TestAutoVoiceReply:
 
     def test_off_mode_text(self, runner):
         assert self._call(runner, "off", MessageType.TEXT) is False
+
+    def test_global_auto_tts_off_suppresses_runner_even_in_all_mode(self, runner):
+        runner._voice_auto_tts_enabled = False
+        assert self._call(runner, "all", MessageType.TEXT) is False
 
     # -- Discord VC exception: runner must handle --------------------------
 

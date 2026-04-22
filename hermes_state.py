@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     user_id TEXT,
+    platform TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    session_key TEXT,
+    shared_session INTEGER DEFAULT 0,
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
@@ -88,6 +95,64 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS room_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_key TEXT NOT NULL,
+    message_id TEXT,
+    appinfo TEXT,
+    refer_id TEXT,
+    seq TEXT,
+    sender_id TEXT,
+    sender_name TEXT,
+    direction TEXT NOT NULL,
+    message_type INTEGER DEFAULT 0,
+    text_preview TEXT,
+    raw_payload TEXT,
+    created_at REAL NOT NULL,
+    triggered INTEGER NOT NULL DEFAULT 0,
+    consumed_for_context INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_room_messages_key
+ON room_messages(platform, conversation_id, message_key);
+
+CREATE INDEX IF NOT EXISTS idx_room_messages_conversation_created
+ON room_messages(platform, conversation_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_room_messages_unconsumed
+ON room_messages(platform, conversation_id, direction, consumed_for_context, triggered, id DESC);
+
+CREATE TABLE IF NOT EXISTS juhe_attachment_parse_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    bucket TEXT,
+    object_key TEXT,
+    object_url TEXT,
+    file_id TEXT,
+    file_md5 TEXT,
+    media_type TEXT,
+    file_name TEXT,
+    parser TEXT,
+    extracted_text TEXT NOT NULL DEFAULT '',
+    content_kind TEXT,
+    display_description TEXT,
+    parse_status TEXT,
+    error_message TEXT,
+    content_format TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_juhe_attachment_parse_cache_identity
+ON juhe_attachment_parse_cache(platform, identity_kind, identity_value);
+
+CREATE INDEX IF NOT EXISTS idx_juhe_attachment_parse_cache_created
+ON juhe_attachment_parse_cache(platform, created_at DESC);
 """
 
 FTS_SQL = """
@@ -109,6 +174,130 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
+"""
+
+ROOM_MESSAGES_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS room_messages_fts USING fts5(
+    searchable_text,
+    platform UNINDEXED,
+    conversation_id UNINDEXED,
+    sender_name UNINDEXED,
+    text_preview UNINDEXED,
+    direction UNINDEXED,
+    message_type UNINDEXED,
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS room_messages_fts_insert AFTER INSERT ON room_messages BEGIN
+    INSERT INTO room_messages_fts(
+        rowid,
+        searchable_text,
+        platform,
+        conversation_id,
+        sender_name,
+        text_preview,
+        direction,
+        message_type
+    )
+    VALUES (
+        new.id,
+        trim(
+            coalesce(new.sender_name, '') || ' ' ||
+            coalesce(new.text_preview, '') || ' ' ||
+            CASE
+                WHEN lower(coalesce(new.direction, '')) = 'outbound' THEN 'outbound sent assistant'
+                ELSE 'inbound received user'
+            END || ' ' ||
+            CASE
+                WHEN CAST(COALESCE(new.message_type, 0) AS INTEGER) = 2 THEN 'text message'
+                WHEN CAST(COALESCE(new.message_type, 0) AS INTEGER) = 8 THEN 'file document attachment'
+                ELSE 'message'
+            END
+        ),
+        coalesce(new.platform, ''),
+        coalesce(new.conversation_id, ''),
+        coalesce(new.sender_name, ''),
+        coalesce(new.text_preview, ''),
+        coalesce(new.direction, ''),
+        CAST(COALESCE(new.message_type, 0) AS TEXT)
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS room_messages_fts_delete AFTER DELETE ON room_messages BEGIN
+    DELETE FROM room_messages_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS room_messages_fts_update AFTER UPDATE ON room_messages BEGIN
+    DELETE FROM room_messages_fts WHERE rowid = old.id;
+    INSERT INTO room_messages_fts(
+        rowid,
+        searchable_text,
+        platform,
+        conversation_id,
+        sender_name,
+        text_preview,
+        direction,
+        message_type
+    )
+    VALUES (
+        new.id,
+        trim(
+            coalesce(new.sender_name, '') || ' ' ||
+            coalesce(new.text_preview, '') || ' ' ||
+            CASE
+                WHEN lower(coalesce(new.direction, '')) = 'outbound' THEN 'outbound sent assistant'
+                ELSE 'inbound received user'
+            END || ' ' ||
+            CASE
+                WHEN CAST(COALESCE(new.message_type, 0) AS INTEGER) = 2 THEN 'text message'
+                WHEN CAST(COALESCE(new.message_type, 0) AS INTEGER) = 8 THEN 'file document attachment'
+                ELSE 'message'
+            END
+        ),
+        coalesce(new.platform, ''),
+        coalesce(new.conversation_id, ''),
+        coalesce(new.sender_name, ''),
+        coalesce(new.text_preview, ''),
+        coalesce(new.direction, ''),
+        CAST(COALESCE(new.message_type, 0) AS TEXT)
+    );
+END;
+"""
+
+ROOM_MESSAGES_FTS_REBUILD_SQL = """
+DELETE FROM room_messages_fts;
+INSERT INTO room_messages_fts(
+    rowid,
+    searchable_text,
+    platform,
+    conversation_id,
+    sender_name,
+    text_preview,
+    direction,
+    message_type
+)
+SELECT
+    id,
+    trim(
+        coalesce(sender_name, '') || ' ' ||
+        coalesce(text_preview, '') || ' ' ||
+        CASE
+            WHEN lower(coalesce(direction, '')) = 'outbound' THEN 'outbound sent assistant'
+            ELSE 'inbound received user'
+        END || ' ' ||
+        CASE
+            WHEN CAST(COALESCE(message_type, 0) AS INTEGER) = 2 THEN 'text message'
+            WHEN CAST(COALESCE(message_type, 0) AS INTEGER) = 8 THEN 'file document attachment'
+            ELSE 'message'
+        END
+    ),
+    coalesce(platform, ''),
+    coalesce(conversation_id, ''),
+    coalesce(sender_name, ''),
+    coalesce(text_preview, ''),
+    coalesce(direction, ''),
+    CAST(COALESCE(message_type, 0) AS TEXT)
+FROM room_messages;
 """
 
 
@@ -134,6 +323,50 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
+    _ROOM_HISTORY_TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]{2,}|[\u4e00-\u9fff]{2,}")
+    _ROOM_HISTORY_FILLER_PATTERNS = (
+        r"@[\w\-\u4e00-\u9fff]+",
+        r"有没有说过",
+        r"有和你说过",
+        r"跟你说过",
+        r"是否聊过",
+        r"有没有提过",
+        r"还记得",
+        r"记得",
+        r"说过",
+        r"聊过",
+        r"提过",
+        r"之前",
+        r"以前",
+        r"上次",
+        r"刚才",
+        r"是否",
+        r"重新",
+        r"那个",
+        r"这个",
+        r"那次",
+        r"这次",
+        r"的事[吗么呢啊呀]?",
+        r"事情",
+        r"这件事",
+    )
+    _ROOM_HISTORY_STOP_TOKENS = {
+        "一下",
+        "一下子",
+        "一下哈",
+        "请问",
+        "麻烦",
+        "帮忙",
+        "看看",
+        "确认",
+        "一下吧",
+        "什么",
+        "怎么",
+        "可以",
+        "需要",
+        "处理",
+        "问题",
+    }
 
     def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -252,6 +485,7 @@ class SessionDB:
     def _init_schema(self):
         """Create tables and FTS if they don't exist, run migrations."""
         cursor = self._conn.cursor()
+        rebuild_room_messages_fts = False
 
         cursor.executescript(SCHEMA_SQL)
 
@@ -329,6 +563,142 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS room_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        platform TEXT NOT NULL,
+                        conversation_id TEXT NOT NULL,
+                        message_key TEXT NOT NULL,
+                        message_id TEXT,
+                        appinfo TEXT,
+                        refer_id TEXT,
+                        seq TEXT,
+                        sender_id TEXT,
+                        sender_name TEXT,
+                        direction TEXT NOT NULL,
+                        message_type INTEGER DEFAULT 0,
+                        text_preview TEXT,
+                        raw_payload TEXT,
+                        created_at REAL NOT NULL,
+                        triggered INTEGER NOT NULL DEFAULT 0,
+                        consumed_for_context INTEGER NOT NULL DEFAULT 0
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_room_messages_key
+                    ON room_messages(platform, conversation_id, message_key);
+
+                    CREATE INDEX IF NOT EXISTS idx_room_messages_conversation_created
+                    ON room_messages(platform, conversation_id, created_at DESC, id DESC);
+
+                    CREATE INDEX IF NOT EXISTS idx_room_messages_unconsumed
+                    ON room_messages(platform, conversation_id, direction, consumed_for_context, triggered, id DESC);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS juhe_attachment_parse_cache (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        platform TEXT NOT NULL,
+                        identity_kind TEXT NOT NULL,
+                        identity_value TEXT NOT NULL,
+                        bucket TEXT,
+                        object_key TEXT,
+                        object_url TEXT,
+                        file_id TEXT,
+                        file_md5 TEXT,
+                        media_type TEXT,
+                        file_name TEXT,
+                        parser TEXT,
+                        extracted_text TEXT NOT NULL DEFAULT '',
+                        content_kind TEXT,
+                        display_description TEXT,
+                        parse_status TEXT,
+                        error_message TEXT,
+                        content_format TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_juhe_attachment_parse_cache_identity
+                    ON juhe_attachment_parse_cache(platform, identity_kind, identity_value);
+
+                    CREATE INDEX IF NOT EXISTS idx_juhe_attachment_parse_cache_created
+                    ON juhe_attachment_parse_cache(platform, created_at DESC);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 8")
+            if current_version < 9:
+                for col_name, col_type in [
+                    ("content_kind", "TEXT"),
+                    ("display_description", "TEXT"),
+                    ("parse_status", "TEXT"),
+                    ("error_message", "TEXT"),
+                    ("content_format", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE juhe_attachment_parse_cache ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.execute(
+                    """
+                    UPDATE juhe_attachment_parse_cache
+                    SET parse_status = COALESCE(parse_status, 'success'),
+                        content_kind = COALESCE(
+                            content_kind,
+                            CASE
+                                WHEN lower(COALESCE(media_type, '')) LIKE 'image/%' THEN 'image'
+                                ELSE 'document'
+                            END
+                        ),
+                        content_format = COALESCE(
+                            content_format,
+                            CASE
+                                WHEN lower(COALESCE(media_type, '')) LIKE 'image/%' THEN 'vision'
+                                ELSE 'text'
+                            END
+                        )
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 9")
+            if current_version < 10:
+                for col_name, col_type in [
+                    ("platform", "TEXT"),
+                    ("chat_id", "TEXT"),
+                    ("chat_type", "TEXT"),
+                    ("thread_id", "TEXT"),
+                    ("session_key", "TEXT"),
+                    ("shared_session", "INTEGER DEFAULT 0"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                try:
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_sessions_platform_chat "
+                        "ON sessions(platform, chat_id, chat_type, thread_id, started_at DESC)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+                        "ON sessions(session_key)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 10")
+                rebuild_room_messages_fts = True
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -339,12 +709,30 @@ class SessionDB:
             )
         except sqlite3.OperationalError:
             pass  # Index already exists
+        for index_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_sessions_platform_chat "
+            "ON sessions(platform, chat_id, chat_type, thread_id, started_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_session_key ON sessions(session_key)",
+        ):
+            try:
+                cursor.execute(index_sql)
+            except sqlite3.OperationalError:
+                pass
 
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
         try:
             cursor.execute("SELECT * FROM messages_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_SQL)
+
+        try:
+            cursor.execute("SELECT * FROM room_messages_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            cursor.executescript(ROOM_MESSAGES_FTS_SQL)
+            rebuild_room_messages_fts = True
+
+        if rebuild_room_messages_fts:
+            cursor.executescript(ROOM_MESSAGES_FTS_REBUILD_SQL)
 
         self._conn.commit()
 
@@ -361,17 +749,32 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        platform: str = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        session_key: str = None,
+        shared_session: bool = False,
     ) -> str:
         """Create a new session record. Returns the session_id."""
         def _do(conn):
             conn.execute(
-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR IGNORE INTO sessions (
+                   id, source, user_id, platform, chat_id, chat_type, thread_id,
+                   session_key, shared_session, model, model_config, system_prompt,
+                   parent_session_id, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
                     user_id,
+                    platform,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    session_key,
+                    int(bool(shared_session)),
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
@@ -929,6 +1332,817 @@ class SessionDB:
                         msg["codex_reasoning_items"] = None
             messages.append(msg)
         return messages
+
+    # =========================================================================
+    # Room raw-message window storage
+    # =========================================================================
+
+    @staticmethod
+    def _room_message_key(
+        *,
+        message_id: Optional[str],
+        appinfo: Optional[str],
+        seq: Optional[str],
+        sender_id: Optional[str],
+        created_at: float,
+    ) -> str:
+        if message_id:
+            return f"message_id:{message_id}"
+        if appinfo:
+            return f"appinfo:{appinfo}"
+        if seq:
+            return f"seq:{seq}"
+        sender = str(sender_id or "").strip() or "unknown"
+        return f"fallback:{sender}:{int(created_at * 1000)}"
+
+    @staticmethod
+    def _deserialize_room_message(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        raw_payload = item.get("raw_payload")
+        if raw_payload:
+            try:
+                item["raw_payload"] = json.loads(raw_payload)
+            except (json.JSONDecodeError, TypeError):
+                item["raw_payload"] = raw_payload
+        else:
+            item["raw_payload"] = None
+        item["triggered"] = bool(item.get("triggered"))
+        item["consumed_for_context"] = bool(item.get("consumed_for_context"))
+        return item
+
+    def append_room_message(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        message_id: Optional[str] = None,
+        appinfo: Optional[str] = None,
+        refer_id: Optional[str] = None,
+        seq: Optional[str] = None,
+        sender_id: Optional[str] = None,
+        sender_name: Optional[str] = None,
+        direction: str,
+        message_type: int = 0,
+        text_preview: Optional[str] = None,
+        raw_payload: Any = None,
+        created_at: Optional[float] = None,
+        triggered: bool = False,
+        consumed_for_context: bool = False,
+        room_log_limit: int = 500,
+    ) -> int:
+        created_ts = float(created_at if created_at is not None else time.time())
+        normalized_platform = str(platform or "").strip()
+        normalized_conversation_id = str(conversation_id or "").strip()
+        normalized_message_id = str(message_id or "").strip() or None
+        normalized_appinfo = str(appinfo or "").strip() or None
+        normalized_seq = str(seq or "").strip() or None
+        message_key = self._room_message_key(
+            message_id=normalized_message_id,
+            appinfo=normalized_appinfo,
+            seq=normalized_seq,
+            sender_id=sender_id,
+            created_at=created_ts,
+        )
+        raw_payload_json = (
+            json.dumps(raw_payload, ensure_ascii=False, default=str)
+            if raw_payload is not None
+            else None
+        )
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO room_messages (
+                    platform, conversation_id, message_key, message_id, appinfo,
+                    refer_id, seq, sender_id, sender_name, direction, message_type,
+                    text_preview, raw_payload, created_at, triggered, consumed_for_context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, conversation_id, message_key) DO UPDATE SET
+                    message_id = COALESCE(excluded.message_id, room_messages.message_id),
+                    appinfo = COALESCE(excluded.appinfo, room_messages.appinfo),
+                    refer_id = COALESCE(excluded.refer_id, room_messages.refer_id),
+                    seq = COALESCE(excluded.seq, room_messages.seq),
+                    sender_id = COALESCE(excluded.sender_id, room_messages.sender_id),
+                    sender_name = COALESCE(excluded.sender_name, room_messages.sender_name),
+                    direction = excluded.direction,
+                    message_type = excluded.message_type,
+                    text_preview = COALESCE(excluded.text_preview, room_messages.text_preview),
+                    raw_payload = COALESCE(excluded.raw_payload, room_messages.raw_payload),
+                    created_at = excluded.created_at,
+                    triggered = MAX(room_messages.triggered, excluded.triggered),
+                    consumed_for_context = MAX(room_messages.consumed_for_context, excluded.consumed_for_context)
+                """,
+                (
+                    normalized_platform,
+                    normalized_conversation_id,
+                    message_key,
+                    normalized_message_id,
+                    normalized_appinfo,
+                    str(refer_id or "").strip() or None,
+                    normalized_seq,
+                    str(sender_id or "").strip() or None,
+                    str(sender_name or "").strip() or None,
+                    str(direction or "").strip() or "inbound",
+                    int(message_type or 0),
+                    str(text_preview or "") or None,
+                    raw_payload_json,
+                    created_ts,
+                    int(bool(triggered)),
+                    int(bool(consumed_for_context)),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id FROM room_messages
+                WHERE platform = ? AND conversation_id = ? AND message_key = ?
+                """,
+                (normalized_platform, normalized_conversation_id, message_key),
+            ).fetchone()
+            limit = max(int(room_log_limit or 0), 0)
+            if limit > 0:
+                conn.execute(
+                    """
+                    DELETE FROM room_messages
+                    WHERE platform = ? AND conversation_id = ?
+                      AND id NOT IN (
+                          SELECT id FROM room_messages
+                          WHERE platform = ? AND conversation_id = ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (
+                        normalized_platform,
+                        normalized_conversation_id,
+                        normalized_platform,
+                        normalized_conversation_id,
+                        limit,
+                    ),
+                )
+            return int(row["id"]) if row else 0
+
+        return self._execute_write(_do)
+
+    def get_room_history(
+        self,
+        platform: str,
+        conversation_id: str,
+        *,
+        before_message_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        normalized_platform = str(platform or "").strip()
+        normalized_conversation_id = str(conversation_id or "").strip()
+        fetch_limit = max(int(limit or 0), 1)
+        params: List[Any] = [normalized_platform, normalized_conversation_id]
+        cursor_sql = ""
+        if before_message_id:
+            cursor_sql = (
+                "AND id < COALESCE(("
+                "SELECT id FROM room_messages "
+                "WHERE platform = ? AND conversation_id = ? AND message_id = ? "
+                "ORDER BY id DESC LIMIT 1"
+                "), 9223372036854775807)"
+            )
+            params.extend([normalized_platform, normalized_conversation_id, str(before_message_id)])
+
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                SELECT * FROM room_messages
+                WHERE platform = ? AND conversation_id = ?
+                {cursor_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params + [fetch_limit],
+            )
+            rows = cursor.fetchall()
+        return [self._deserialize_room_message(row) for row in reversed(rows)]
+
+    def get_unconsumed_room_messages(
+        self,
+        platform: str,
+        conversation_id: str,
+        *,
+        limit: int,
+        char_limit: int,
+    ) -> List[Dict[str, Any]]:
+        normalized_platform = str(platform or "").strip()
+        normalized_conversation_id = str(conversation_id or "").strip()
+        max_messages = max(int(limit or 0), 0)
+        max_chars = max(int(char_limit or 0), 0)
+        if max_messages <= 0 or max_chars <= 0:
+            return []
+
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM room_messages
+                WHERE platform = ? AND conversation_id = ?
+                  AND direction = 'inbound'
+                  AND triggered = 0
+                  AND consumed_for_context = 0
+                ORDER BY id DESC
+                LIMIT 200
+                """,
+                (normalized_platform, normalized_conversation_id),
+            )
+            rows = cursor.fetchall()
+
+        selected: List[Dict[str, Any]] = []
+        total_chars = 0
+        for row in rows:
+            item = self._deserialize_room_message(row)
+            preview_len = len(str(item.get("text_preview") or ""))
+            if selected and (
+                len(selected) >= max_messages
+                or total_chars + preview_len > max_chars
+            ):
+                break
+            if preview_len > max_chars and not selected:
+                break
+            selected.append(item)
+            total_chars += preview_len
+
+        return list(reversed(selected))
+
+    @classmethod
+    def _normalize_room_history_phrase(cls, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(query or "")).strip()
+        return normalized.strip('"')
+
+    @classmethod
+    def _extract_room_history_terms(cls, query: str) -> List[str]:
+        text = str(query or "").strip()
+        if not text:
+            return []
+        cleaned = re.sub(r"[，。！？、,:;()（）“”\"'`]+", " ", text)
+        for pattern in cls._ROOM_HISTORY_FILLER_PATTERNS:
+            cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[你我他她它和有是都还再又把给跟呢吗么呀啊哦哇啦]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        terms: List[str] = []
+        seen: set[str] = set()
+        for token in cls._ROOM_HISTORY_TOKEN_RE.findall(cleaned):
+            normalized = token.strip().lower()
+            if (
+                not normalized
+                or normalized in cls._ROOM_HISTORY_STOP_TOKENS
+                or len(normalized) < 2
+            ):
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                terms.append(normalized)
+        return terms
+
+    def _search_room_messages_fts(
+        self,
+        *,
+        platform: str,
+        conversation_id: str,
+        match_query: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if not match_query:
+            return []
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    """
+                    SELECT
+                        rm.id,
+                        rm.message_id,
+                        rm.created_at,
+                        rm.sender_name,
+                        rm.text_preview,
+                        rm.triggered,
+                        rm.direction
+                    FROM room_messages_fts
+                    JOIN room_messages rm ON rm.id = room_messages_fts.rowid
+                    WHERE room_messages_fts MATCH ?
+                      AND rm.platform = ?
+                      AND rm.conversation_id = ?
+                    ORDER BY bm25(room_messages_fts), rm.created_at DESC, rm.id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        match_query,
+                        str(platform or "").strip(),
+                        str(conversation_id or "").strip(),
+                        max(int(limit or 0), 1),
+                    ),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+            except sqlite3.OperationalError:
+                return []
+
+    @classmethod
+    def _rank_search_hits(
+        cls,
+        *,
+        hits: List[Dict[str, Any]],
+        terms: List[str],
+        phase_rank: int,
+        bucket: Dict[int, Dict[str, Any]],
+    ) -> None:
+        for row in hits:
+            row_id = int(row.get("id") or 0)
+            haystack = " ".join(
+                [
+                    str(row.get("sender_name") or ""),
+                    str(row.get("text_preview") or ""),
+                    str(row.get("content") or ""),
+                    str(row.get("role") or ""),
+                ]
+            ).lower()
+            token_hits = sum(haystack.count(term) for term in terms if term)
+            existing = bucket.get(row_id)
+            candidate = dict(row)
+            candidate["_phase_rank"] = phase_rank
+            candidate["_token_hits"] = token_hits
+            candidate["_score"] = phase_rank * 10 + token_hits * 10
+            if existing is None or (
+                candidate["_score"],
+                float(row.get("created_at") or 0.0),
+                float(row.get("timestamp") or 0.0),
+                row_id,
+            ) > (
+                existing["_score"],
+                float(existing.get("created_at") or 0.0),
+                float(existing.get("timestamp") or 0.0),
+                int(existing.get("id") or 0),
+            ):
+                bucket[row_id] = candidate
+
+    def search_room_history(
+        self,
+        platform: str,
+        conversation_id: str,
+        *,
+        query: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        if not str(query or "").strip():
+            return []
+
+        fetch_limit = max(int(limit or 0), 1)
+        normalized_platform = str(platform or "").strip()
+        normalized_conversation_id = str(conversation_id or "").strip()
+        terms = self._extract_room_history_terms(query)
+        phrase = self._normalize_room_history_phrase(query)
+        ranked: Dict[int, Dict[str, Any]] = {}
+
+        if phrase:
+            phrase_query = self._sanitize_fts5_query(f'"{phrase}"')
+            if phrase_query:
+                self._rank_search_hits(
+                    hits=self._search_room_messages_fts(
+                        platform=normalized_platform,
+                        conversation_id=normalized_conversation_id,
+                        match_query=phrase_query,
+                        limit=max(fetch_limit * 3, 10),
+                    ),
+                    terms=terms,
+                    phase_rank=3,
+                    bucket=ranked,
+                )
+
+        if terms:
+            keyword_query = " OR ".join(
+                token for token in (self._sanitize_fts5_query(term) for term in terms) if token
+            )
+            if keyword_query:
+                self._rank_search_hits(
+                    hits=self._search_room_messages_fts(
+                        platform=normalized_platform,
+                        conversation_id=normalized_conversation_id,
+                        match_query=keyword_query,
+                        limit=max(fetch_limit * 5, 15),
+                    ),
+                    terms=terms,
+                    phase_rank=2,
+                    bucket=ranked,
+                )
+
+        if not ranked:
+            recent_messages = self.get_room_history(
+                normalized_platform,
+                normalized_conversation_id,
+                limit=500,
+            )
+            lowered_phrase = phrase.lower()
+            for item in reversed(recent_messages):
+                haystack = " ".join(
+                    [
+                        str(item.get("sender_name") or ""),
+                        str(item.get("text_preview") or ""),
+                    ]
+                ).lower()
+                if lowered_phrase and lowered_phrase in haystack:
+                    fallback_hits = terms
+                else:
+                    fallback_hits = [term for term in terms if term in haystack]
+                if not fallback_hits:
+                    continue
+                ranked[int(item["id"])] = {
+                    "id": int(item["id"]),
+                    "message_id": item.get("message_id"),
+                    "created_at": item.get("created_at"),
+                    "sender_name": item.get("sender_name"),
+                    "text_preview": item.get("text_preview"),
+                    "triggered": item.get("triggered"),
+                    "direction": item.get("direction"),
+                    "_phase_rank": 1,
+                    "_token_hits": len(fallback_hits),
+                    "_score": 10 + len(fallback_hits) * 10,
+                }
+
+        ordered = sorted(
+            ranked.values(),
+            key=lambda item: (
+                int(item.get("_score") or 0),
+                float(item.get("created_at") or 0.0),
+                int(item.get("id") or 0),
+            ),
+            reverse=True,
+        )[:fetch_limit]
+
+        return [
+            {
+                "message_id": item.get("message_id"),
+                "created_at": item.get("created_at"),
+                "sender_name": item.get("sender_name"),
+                "text_preview": item.get("text_preview"),
+                "score": int(item.get("_score") or 0),
+                "triggered": bool(item.get("triggered")),
+                "direction": item.get("direction"),
+            }
+            for item in ordered
+        ]
+
+    def _search_prior_session_messages_fts(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        chat_type: str,
+        thread_id: Optional[str],
+        exclude_session_id: str,
+        match_query: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        thread_value = str(thread_id or "").strip()
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    """
+                    SELECT
+                        m.id,
+                        m.session_id,
+                        m.role,
+                        m.content,
+                        m.timestamp,
+                        s.started_at,
+                        s.session_key
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                      AND s.platform = ?
+                      AND s.chat_id = ?
+                      AND s.chat_type = ?
+                      AND COALESCE(s.thread_id, '') = ?
+                      AND s.id != ?
+                      AND m.role IN ('user', 'assistant')
+                    ORDER BY bm25(messages_fts), m.timestamp DESC, m.id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        match_query,
+                        str(platform or "").strip(),
+                        str(chat_id or "").strip(),
+                        str(chat_type or "").strip(),
+                        thread_value,
+                        str(exclude_session_id or "").strip(),
+                        max(int(limit or 0), 1),
+                    ),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+            except sqlite3.OperationalError:
+                return []
+
+    def search_prior_session_messages(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        chat_type: str,
+        exclude_session_id: str,
+        query: str,
+        limit: int = 6,
+        thread_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not str(query or "").strip():
+            return []
+
+        fetch_limit = max(int(limit or 0), 1)
+        terms = self._extract_room_history_terms(query)
+        phrase = self._normalize_room_history_phrase(query)
+        ranked: Dict[int, Dict[str, Any]] = {}
+
+        if phrase:
+            phrase_query = self._sanitize_fts5_query(f'"{phrase}"')
+            if phrase_query:
+                self._rank_search_hits(
+                    hits=self._search_prior_session_messages_fts(
+                        platform=platform,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        thread_id=thread_id,
+                        exclude_session_id=exclude_session_id,
+                        match_query=phrase_query,
+                        limit=max(fetch_limit * 3, 10),
+                    ),
+                    terms=terms,
+                    phase_rank=3,
+                    bucket=ranked,
+                )
+
+        if terms:
+            keyword_query = " OR ".join(
+                token for token in (self._sanitize_fts5_query(term) for term in terms) if token
+            )
+            if keyword_query:
+                self._rank_search_hits(
+                    hits=self._search_prior_session_messages_fts(
+                        platform=platform,
+                        chat_id=chat_id,
+                        chat_type=chat_type,
+                        thread_id=thread_id,
+                        exclude_session_id=exclude_session_id,
+                        match_query=keyword_query,
+                        limit=max(fetch_limit * 5, 15),
+                    ),
+                    terms=terms,
+                    phase_rank=2,
+                    bucket=ranked,
+                )
+
+        ordered = sorted(
+            ranked.values(),
+            key=lambda item: (
+                int(item.get("_score") or 0),
+                float(item.get("timestamp") or 0.0),
+                int(item.get("id") or 0),
+            ),
+            reverse=True,
+        )[:fetch_limit]
+
+        return [
+            {
+                "session_id": item.get("session_id"),
+                "role": item.get("role"),
+                "content": item.get("content"),
+                "timestamp": item.get("timestamp"),
+                "started_at": item.get("started_at"),
+                "session_key": item.get("session_key"),
+                "score": int(item.get("_score") or 0),
+            }
+            for item in ordered
+        ]
+
+    def mark_room_messages_consumed(
+        self,
+        platform: str,
+        conversation_id: str,
+        row_ids: List[int],
+    ) -> None:
+        normalized_ids = [int(row_id) for row_id in row_ids if row_id]
+        if not normalized_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in normalized_ids)
+
+        def _do(conn):
+            conn.execute(
+                f"""
+                UPDATE room_messages
+                SET consumed_for_context = 1
+                WHERE platform = ? AND conversation_id = ? AND id IN ({placeholders})
+                """,
+                [str(platform or "").strip(), str(conversation_id or "").strip(), *normalized_ids],
+            )
+
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Juhe attachment parse cache
+    # =========================================================================
+
+    @staticmethod
+    def _normalize_juhe_attachment_object_url(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = urlsplit(text)
+        except ValueError:
+            return text.split("?", 1)[0].split("#", 1)[0].strip()
+        if not parsed.scheme or not parsed.netloc:
+            return text.split("?", 1)[0].split("#", 1)[0].strip()
+        return urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                parsed.path,
+                "",
+                "",
+            )
+        )
+
+    @staticmethod
+    def _juhe_attachment_cache_candidates(
+        *,
+        bucket: Any = None,
+        object_key: Any = None,
+        object_url: Any = None,
+        file_id: Any = None,
+        file_md5: Any = None,
+    ) -> List[tuple[str, str]]:
+        candidates: List[tuple[str, str]] = []
+        normalized_bucket = str(bucket or "").strip().strip("/")
+        normalized_object_key = str(object_key or "").strip().lstrip("/")
+        if normalized_bucket and normalized_object_key:
+            candidates.append(("bucket_key", f"{normalized_bucket}/{normalized_object_key}"))
+
+        normalized_object_url = SessionDB._normalize_juhe_attachment_object_url(object_url)
+        if normalized_object_url:
+            candidates.append(("object_url", normalized_object_url))
+
+        normalized_file_id = str(file_id or "").strip()
+        normalized_md5 = str(file_md5 or "").strip().lower()
+        if normalized_file_id and normalized_md5:
+            candidates.append(("file_id_md5", f"{normalized_file_id}:{normalized_md5}"))
+
+        return candidates
+
+    def get_juhe_attachment_parse_cache(
+        self,
+        *,
+        platform: str,
+        bucket: Any = None,
+        object_key: Any = None,
+        object_url: Any = None,
+        file_id: Any = None,
+        file_md5: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_platform = str(platform or "").strip()
+        if not normalized_platform:
+            return None
+        candidates = self._juhe_attachment_cache_candidates(
+            bucket=bucket,
+            object_key=object_key,
+            object_url=object_url,
+            file_id=file_id,
+            file_md5=file_md5,
+        )
+        if not candidates:
+            return None
+
+        with self._lock:
+            for identity_kind, identity_value in candidates:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM juhe_attachment_parse_cache
+                    WHERE platform = ? AND identity_kind = ? AND identity_value = ?
+                    LIMIT 1
+                    """,
+                    (normalized_platform, identity_kind, identity_value),
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
+        return None
+
+    def upsert_juhe_attachment_parse_cache(
+        self,
+        *,
+        platform: str,
+        bucket: Any = None,
+        object_key: Any = None,
+        object_url: Any = None,
+        file_id: Any = None,
+        file_md5: Any = None,
+        media_type: Any = None,
+        file_name: Any = None,
+        parser: Any = None,
+        extracted_text: Any = None,
+        content_kind: Any = None,
+        display_description: Any = None,
+        parse_status: Any = None,
+        error_message: Any = None,
+        content_format: Any = None,
+        created_at: Optional[float] = None,
+    ) -> int:
+        normalized_platform = str(platform or "").strip()
+        if not normalized_platform:
+            raise ValueError("platform is required")
+        candidates = self._juhe_attachment_cache_candidates(
+            bucket=bucket,
+            object_key=object_key,
+            object_url=object_url,
+            file_id=file_id,
+            file_md5=file_md5,
+        )
+        if not candidates:
+            raise ValueError("a stable Juhe attachment identity is required")
+        text = str(extracted_text or "").strip()
+        normalized_media_type = str(media_type or "").strip().lower()
+        normalized_status = str(parse_status or "").strip().lower()
+        if normalized_status not in {"pending", "success", "failed"}:
+            normalized_status = "success" if text else "pending"
+        if normalized_status == "success" and not text:
+            raise ValueError("extracted_text is required when parse_status=success")
+        normalized_content_kind = str(content_kind or "").strip().lower()
+        if normalized_content_kind not in {"image", "document"}:
+            normalized_content_kind = "image" if normalized_media_type.startswith("image/") else "document"
+        normalized_content_format = str(content_format or "").strip().lower()
+        if normalized_content_format not in {"text", "markdown", "vision"}:
+            if normalized_content_kind == "image":
+                normalized_content_format = "vision"
+            else:
+                normalized_content_format = "text"
+
+        identity_kind, identity_value = candidates[0]
+        now = float(created_at if created_at is not None else time.time())
+        normalized_object_url = self._normalize_juhe_attachment_object_url(object_url) or None
+        normalized_bucket = str(bucket or "").strip().strip("/") or None
+        normalized_object_key = str(object_key or "").strip().lstrip("/") or None
+        normalized_file_id = str(file_id or "").strip() or None
+        normalized_file_md5 = str(file_md5 or "").strip().lower() or None
+        normalized_description = str(display_description or "").strip() or None
+        normalized_error = str(error_message or "").strip() or None
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO juhe_attachment_parse_cache (
+                    platform, identity_kind, identity_value, bucket, object_key,
+                    object_url, file_id, file_md5, media_type, file_name, parser,
+                    extracted_text, content_kind, display_description, parse_status,
+                    error_message, content_format, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, identity_kind, identity_value) DO UPDATE SET
+                    bucket = COALESCE(excluded.bucket, juhe_attachment_parse_cache.bucket),
+                    object_key = COALESCE(excluded.object_key, juhe_attachment_parse_cache.object_key),
+                    object_url = COALESCE(excluded.object_url, juhe_attachment_parse_cache.object_url),
+                    file_id = COALESCE(excluded.file_id, juhe_attachment_parse_cache.file_id),
+                    file_md5 = COALESCE(excluded.file_md5, juhe_attachment_parse_cache.file_md5),
+                    media_type = COALESCE(excluded.media_type, juhe_attachment_parse_cache.media_type),
+                    file_name = COALESCE(excluded.file_name, juhe_attachment_parse_cache.file_name),
+                    parser = COALESCE(excluded.parser, juhe_attachment_parse_cache.parser),
+                    extracted_text = excluded.extracted_text,
+                    content_kind = COALESCE(excluded.content_kind, juhe_attachment_parse_cache.content_kind),
+                    display_description = COALESCE(excluded.display_description, juhe_attachment_parse_cache.display_description),
+                    parse_status = COALESCE(excluded.parse_status, juhe_attachment_parse_cache.parse_status),
+                    error_message = COALESCE(excluded.error_message, juhe_attachment_parse_cache.error_message),
+                    content_format = COALESCE(excluded.content_format, juhe_attachment_parse_cache.content_format),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_platform,
+                    identity_kind,
+                    identity_value,
+                    normalized_bucket,
+                    normalized_object_key,
+                    normalized_object_url,
+                    normalized_file_id,
+                    normalized_file_md5,
+                    normalized_media_type or None,
+                    str(file_name or "").strip() or None,
+                    str(parser or "").strip() or None,
+                    text,
+                    normalized_content_kind,
+                    normalized_description,
+                    normalized_status,
+                    normalized_error,
+                    normalized_content_format,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id FROM juhe_attachment_parse_cache
+                WHERE platform = ? AND identity_kind = ? AND identity_value = ?
+                LIMIT 1
+                """,
+                (normalized_platform, identity_kind, identity_value),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+
+        return self._execute_write(_do)
 
     # =========================================================================
     # Search

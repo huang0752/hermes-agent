@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
+from urllib.parse import unquote, urlsplit
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -77,6 +78,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
+from gateway.juhe_room_memory import apply_room_memory_decision
+from memory_routing import is_explicit_memory_request, route_memory_decision
 from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -259,12 +262,98 @@ from gateway.session import (
     build_session_key,
 )
 from gateway.delivery import DeliveryRouter
+import gateway.document_text as document_text
+from gateway.document_text import (
+    build_document_context_for_agent,
+)
+from gateway.delivery_rules import is_certificate_render_job_url
+from gateway.juhe_access_control import JuheAccessControlStore
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    SUPPORTED_DOCUMENT_TYPES,
     merge_pending_message_event,
 )
+
+_STARTUP_ALLOWLIST_ENV_VARS = (
+    "TELEGRAM_ALLOWED_USERS",
+    "DISCORD_ALLOWED_USERS",
+    "WHATSAPP_ALLOWED_USERS",
+    "SLACK_ALLOWED_USERS",
+    "SIGNAL_ALLOWED_USERS",
+    "SIGNAL_GROUP_ALLOWED_USERS",
+    "EMAIL_ALLOWED_USERS",
+    "SMS_ALLOWED_USERS",
+    "MATTERMOST_ALLOWED_USERS",
+    "MATRIX_ALLOWED_USERS",
+    "DINGTALK_ALLOWED_USERS",
+    "FEISHU_ALLOWED_USERS",
+    "WECOM_ALLOWED_USERS",
+    "WECOM_CALLBACK_ALLOWED_USERS",
+    "WEIXIN_ALLOWED_USERS",
+    "JUHE_ALLOWED_USERS",
+    "JUHE_GROUP_ALLOWED_CHATS",
+    "JUHE_TRIGGER_USER_IDS",
+    "BLUEBUBBLES_ALLOWED_USERS",
+    "QQ_ALLOWED_USERS",
+    "GATEWAY_ALLOWED_USERS",
+)
+
+_STARTUP_ALLOW_ALL_ENV_VARS = (
+    "TELEGRAM_ALLOW_ALL_USERS",
+    "DISCORD_ALLOW_ALL_USERS",
+    "WHATSAPP_ALLOW_ALL_USERS",
+    "SLACK_ALLOW_ALL_USERS",
+    "SIGNAL_ALLOW_ALL_USERS",
+    "EMAIL_ALLOW_ALL_USERS",
+    "SMS_ALLOW_ALL_USERS",
+    "MATTERMOST_ALLOW_ALL_USERS",
+    "MATRIX_ALLOW_ALL_USERS",
+    "DINGTALK_ALLOW_ALL_USERS",
+    "FEISHU_ALLOW_ALL_USERS",
+    "WECOM_ALLOW_ALL_USERS",
+    "WECOM_CALLBACK_ALLOW_ALL_USERS",
+    "WEIXIN_ALLOW_ALL_USERS",
+    "BLUEBUBBLES_ALLOW_ALL_USERS",
+    "QQ_ALLOW_ALL_USERS",
+)
+
+
+def _config_has_juhe_access_controls(config: Optional[GatewayConfig]) -> bool:
+    """Treat Juhe platform access controls in config.yaml as real allowlists."""
+    if config is None or not isinstance(config.platforms, dict):
+        return False
+    platform_config = config.platforms.get(Platform.JUHE)
+    if not platform_config or not platform_config.enabled:
+        return False
+
+    extra = platform_config.extra or {}
+    for value in (
+        extra.get("allow_from"),
+        extra.get("group_allow_from"),
+        extra.get("trigger_user_ids"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (list, tuple, set, dict)) and bool(value):
+            return True
+    if JuheAccessControlStore().has_file_access_controls():
+        return True
+    return False
+
+
+def _should_warn_about_missing_user_allowlists(config: Optional[GatewayConfig]) -> bool:
+    """Return True when startup should warn about missing access controls."""
+    any_allowlist = any(os.getenv(var) for var in _STARTUP_ALLOWLIST_ENV_VARS)
+    if not any_allowlist:
+        any_allowlist = _config_has_juhe_access_controls(config)
+
+    allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
+        os.getenv(var, "").lower() in ("true", "1", "yes")
+        for var in _STARTUP_ALLOW_ALL_ENV_VARS
+    )
+    return not any_allowlist and not allow_all
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -316,6 +405,241 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
 logger = logging.getLogger(__name__)
 
+_DELIVERY_URL_KEYS = frozenset(
+    {
+        "download_url",
+        "downloadUrl",
+        "output_url",
+        "outputUrl",
+        "result_url",
+        "resultUrl",
+        "file_url",
+        "fileUrl",
+    }
+)
+_LOCAL_DELIVERY_PATH_KEYS = frozenset(
+    {
+        "local_path",
+        "localPath",
+        "file_path",
+        "filePath",
+    }
+)
+_DELIVERY_MEDIA_EXTS = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".ogg",
+        ".opus",
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".doc",
+        ".xls",
+        *SUPPORTED_DOCUMENT_TYPES.keys(),
+    }
+)
+
+
+def _normalize_delivery_url(value: Any) -> str:
+    """Return a deliverable HTTP(S) URL or an empty string."""
+    text = str(value or "").strip().strip("`\"'")
+    if not text:
+        return ""
+
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+
+    suffix = Path(unquote(parsed.path)).suffix.lower()
+    if suffix not in _DELIVERY_MEDIA_EXTS:
+        return ""
+    return text
+
+
+def _normalize_local_delivery_path(value: Any) -> str:
+    text = str(value or "").strip().strip("`\"'")
+    if not text:
+        return ""
+    if not text.startswith(("~/", "/")):
+        return ""
+    suffix = Path(text).suffix.lower()
+    if suffix not in _DELIVERY_MEDIA_EXTS:
+        return ""
+    return text
+
+
+def _collect_tool_result_media_tags(
+    messages: List[dict[str, Any]] | None,
+    history_media_paths: set[str] | None,
+) -> tuple[list[str], bool, list[str]]:
+    """Collect MEDIA tags and raw delivery URLs from tool results."""
+    media_tags: list[str] = []
+    raw_delivery_urls: list[str] = []
+    seen_media_paths = set(history_media_paths or set())
+    seen_raw_urls = set()
+    has_voice_directive = False
+
+    def _payload_has_local_delivery_artifact(payload: Any) -> bool:
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key in _LOCAL_DELIVERY_PATH_KEYS and _normalize_local_delivery_path(value):
+                    return True
+                if key == "media_tag" and isinstance(value, str):
+                    media_entries, _ = BasePlatformAdapter.extract_media(value)
+                    for media_path, _ in media_entries:
+                        if _normalize_local_delivery_path(media_path):
+                            return True
+                if _payload_has_local_delivery_artifact(value):
+                    return True
+            return False
+        if isinstance(payload, list):
+            return any(_payload_has_local_delivery_artifact(item) for item in payload)
+        if isinstance(payload, str) and payload[:1] in "[{":
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                return False
+            return _payload_has_local_delivery_artifact(parsed)
+        return False
+
+    def _record_media_path(path: str, *, is_voice: bool = False) -> None:
+        nonlocal has_voice_directive
+        cleaned_path = str(path or "").strip().rstrip('",}')
+        if not cleaned_path or cleaned_path in seen_media_paths:
+            return
+        seen_media_paths.add(cleaned_path)
+        media_tags.append(f"MEDIA:{cleaned_path}")
+        if is_voice:
+            has_voice_directive = True
+
+    def _record_delivery_url(value: Any) -> None:
+        url = _normalize_delivery_url(value)
+        if not url:
+            return
+        if not is_certificate_render_job_url(url):
+            _record_media_path(url)
+        if url not in seen_raw_urls:
+            seen_raw_urls.add(url)
+            raw_delivery_urls.append(url)
+
+    def _record_local_delivery_path(value: Any) -> None:
+        local_path = _normalize_local_delivery_path(value)
+        if local_path:
+            _record_media_path(local_path)
+
+    def _walk_payload(payload: Any, *, suppress_delivery_urls: bool = False) -> None:
+        nonlocal has_voice_directive
+        if isinstance(payload, dict):
+            prefer_local = suppress_delivery_urls or _payload_has_local_delivery_artifact(payload)
+            for key, value in payload.items():
+                if key in _LOCAL_DELIVERY_PATH_KEYS:
+                    _record_local_delivery_path(value)
+                elif key in _DELIVERY_URL_KEYS and not prefer_local:
+                    _record_delivery_url(value)
+                _walk_payload(value, suppress_delivery_urls=prefer_local)
+            return
+
+        if isinstance(payload, list):
+            for item in payload:
+                _walk_payload(item, suppress_delivery_urls=suppress_delivery_urls)
+            return
+
+        if not isinstance(payload, str):
+            return
+
+        text = payload.strip()
+        if not text:
+            return
+
+        if "[[audio_as_voice]]" in text:
+            has_voice_directive = True
+
+        if "MEDIA:" in text:
+            media_entries, _ = BasePlatformAdapter.extract_media(text)
+            for media_path, is_voice in media_entries:
+                _record_media_path(media_path, is_voice=is_voice)
+
+        if text[:1] in "[{":
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return
+            _walk_payload(parsed)
+
+    for message in messages or []:
+        if message.get("role") not in ("tool", "function"):
+            continue
+        for key in ("content", "structuredContent", "structured_content", "payload", "result", "output"):
+            if key in message:
+                _walk_payload(message.get(key))
+
+    return media_tags, has_voice_directive, raw_delivery_urls
+
+
+def _strip_delivered_urls_from_response(text: str, urls: list[str]) -> str:
+    """Remove raw delivery URLs from visible assistant text."""
+    cleaned = str(text or "")
+    if not cleaned or not urls:
+        return cleaned
+
+    for url in sorted({str(item).strip() for item in urls if str(item).strip()}, key=len, reverse=True):
+        escaped = re.escape(url)
+        cleaned = re.sub(
+            rf"(?im)^[^\S\r\n]*(?:[-*]\s*)?(?:\d+[、.)．]\s*)?(?:下载链接|下载地址|压缩包下载链接|文件下载链接|文件链接|预览地址|下载结果)?\s*[:：]?\s*{escaped}\s*$\n?",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            rf"\[([^\]]+)\]\(\s*{escaped}\s*\)",
+            r"\1",
+            cleaned,
+        )
+        cleaned = cleaned.replace(url, "")
+
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"(?m)^[ \t]+$", "", cleaned)
+    return cleaned.strip()
+
+
+def _augment_final_response_with_tool_media(
+    final_response: str,
+    messages: List[dict[str, Any]] | None,
+    history_media_paths: set[str] | None,
+) -> str:
+    """Append tool-result media tags and strip raw delivery URLs from visible text."""
+    response = str(final_response or "")
+    media_tags, has_voice_directive, raw_delivery_urls = _collect_tool_result_media_tags(
+        messages,
+        history_media_paths,
+    )
+    response = _strip_delivered_urls_from_response(response, raw_delivery_urls)
+
+    existing_media, _ = BasePlatformAdapter.extract_media(response)
+    existing_paths = {path for path, _ in existing_media}
+    existing_has_voice = "[[audio_as_voice]]" in response or any(is_voice for _, is_voice in existing_media)
+
+    append_tags = [tag for tag in media_tags if tag.split("MEDIA:", 1)[1] not in existing_paths]
+    if not append_tags:
+        return response
+
+    append_lines = list(append_tags)
+    if has_voice_directive and not existing_has_voice:
+        append_lines.insert(0, "[[audio_as_voice]]")
+
+    if response:
+        return response + "\n" + "\n".join(append_lines)
+    return "\n".join(append_lines)
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -359,15 +683,148 @@ def _build_media_placeholder(event) -> str:
     parts = []
     media_urls = getattr(event, "media_urls", None) or []
     media_types = getattr(event, "media_types", None) or []
+    descriptions = getattr(event, "_juhe_media_descriptions", None) or []
     for i, url in enumerate(media_urls):
+        description = str(descriptions[i] or "").strip() if i < len(descriptions) else ""
+        if description:
+            parts.append(description)
+            continue
         mtype = media_types[i] if i < len(media_types) else ""
+        display_ref = os.path.basename(str(url or "").rstrip("/")) or str(url or "")
         if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
-            parts.append(f"[User sent an image: {url}]")
+            parts.append(f"[User sent an image: {display_ref}]")
         elif mtype.startswith("audio/"):
-            parts.append(f"[User sent audio: {url}]")
+            parts.append(f"[User sent audio: {display_ref}]")
         else:
-            parts.append(f"[User sent a file: {url}]")
+            parts.append(f"[User sent a file: {display_ref}]")
     return "\n".join(parts)
+
+
+def _preferred_media_source(event, index: int, default_url: str, media_type: str = "") -> str:
+    """Return the best media source for preprocessing.
+
+    Juhe inbound images and supported remote documents may carry short-lived
+    MinIO presigned URLs that are better suited for preprocessing than the
+    persisted media reference. Other media types and platforms keep using the
+    original path/reference.
+    """
+    source = getattr(event, "source", None)
+    if getattr(source, "platform", None) != Platform.JUHE:
+        return default_url
+
+    normalized_media_type = str(media_type or "").strip().lower()
+    is_image = normalized_media_type.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO
+    is_remote_document = normalized_media_type in {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    }
+    if not is_image and not is_remote_document:
+        return default_url
+
+    access_urls = getattr(event, "_juhe_media_access_urls", None) or []
+    if index >= len(access_urls):
+        return default_url
+    preferred = str(access_urls[index] or "").strip()
+    return preferred or default_url
+
+
+def _juhe_attachment_identity(event, index: int) -> dict:
+    identities = getattr(event, "_juhe_attachment_identities", None) or []
+    if index >= len(identities):
+        return {}
+    identity = identities[index]
+    return identity if isinstance(identity, dict) else {}
+
+
+def _set_juhe_media_description(event, index: int, description: str) -> None:
+    if index < 0:
+        return
+    descriptions = list(getattr(event, "_juhe_media_descriptions", None) or [])
+    while len(descriptions) <= index:
+        descriptions.append("")
+    descriptions[index] = str(description or "").strip()
+    setattr(event, "_juhe_media_descriptions", descriptions)
+
+
+def _build_session_media_manifest(event) -> list[dict]:
+    media_urls = getattr(event, "media_urls", None) or []
+    media_types = getattr(event, "media_types", None) or []
+    descriptions = getattr(event, "_juhe_media_descriptions", None) or []
+    access_urls = getattr(event, "_juhe_media_access_urls", None) or []
+    identities = getattr(event, "_juhe_attachment_identities", None) or []
+    manifest: list[dict] = []
+
+    for i, media_ref in enumerate(media_urls):
+        display_name = os.path.basename(str(media_ref or "").split("?", 1)[0]) or f"attachment-{i + 1}"
+        item = {
+            "index": i,
+            "position": i + 1,
+            "display_name": display_name,
+            "media_ref": str(media_ref or ""),
+            "media_type": str(media_types[i] or "") if i < len(media_types) else "",
+            "description": str(descriptions[i] or "").strip() if i < len(descriptions) else "",
+            "access_url": str(access_urls[i] or "").strip() if i < len(access_urls) else "",
+        }
+        if i < len(identities) and isinstance(identities[i], dict):
+            item["identity"] = identities[i]
+        manifest.append(item)
+
+    return manifest
+
+
+def _build_current_juhe_attachment_context(event) -> str:
+    source = getattr(event, "source", None)
+    if getattr(source, "platform", None) != Platform.JUHE:
+        return ""
+
+    manifest = _build_session_media_manifest(event)
+    if not manifest:
+        return ""
+
+    lines = [
+        "[Current Juhe attachments]",
+        "These files belong to the current inbound message context. If you need to reuse one in an external workflow such as certificate logo upload, do not ask the user for a direct link unless attachment resolution really fails.",
+        "Use `juhe_tool` with `action=\"list_current_attachments\"` to inspect the current attachment list. For certificate workflows, prefer `action=\"upload_current_attachment_to_certificate\"` with the chosen `position` so the file is uploaded without exposing access URLs or dumping base64 into context. Use `action=\"materialize_current_attachment\"` only when a local file path is explicitly needed.",
+    ]
+    for item in manifest:
+        label = str(item.get("description") or "").strip()
+        if not label:
+            display_name = str(item.get("display_name") or f"attachment-{item.get('position', 0)}").strip()
+            media_type = str(item.get("media_type") or "").strip()
+            kind = "图片" if media_type.startswith("image/") else "文件"
+            label = f"{kind} {display_name}"
+        lines.append(f"{int(item.get('position') or 0)}. {label}")
+    return "\n".join(lines)
+
+
+def _truncate_media_description_body(text: str, limit: int = 240) -> str:
+    normalized = " ".join(str(text or "").replace("\r\n", "\n").replace("\r", "\n").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(limit - 1, 1)].rstrip() + "…"
+
+
+def _build_image_media_description(display_name: str, analysis_text: str) -> str:
+    from gateway.juhe_attachment_processing import build_image_media_description
+
+    return build_image_media_description(display_name, analysis_text)
+
+
+def _pending_event_preview_text(event) -> str:
+    placeholder = _build_media_placeholder(event)
+    text = str(getattr(event, "text", "") or "").strip()
+    descriptions = getattr(event, "_juhe_media_descriptions", None) or []
+    has_descriptions = any(str(item or "").strip() for item in descriptions)
+    if not text:
+        return placeholder
+    if has_descriptions and text.startswith("[Received ") and text.endswith("]"):
+        return placeholder or text
+    if has_descriptions and placeholder and placeholder != text:
+        return f"{placeholder}\n\n{text}"
+    return text or placeholder
 
 
 def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
@@ -537,6 +994,7 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _voice_auto_tts_enabled: bool = True
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -549,6 +1007,7 @@ class GatewayRunner:
         self._reasoning_config = self._load_reasoning_config()
         self._service_tier = self._load_service_tier()
         self._show_reasoning = self._load_show_reasoning()
+        self._voice_auto_tts_enabled = self._load_voice_auto_tts_enabled()
         self._busy_input_mode = self._load_busy_input_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
@@ -695,6 +1154,7 @@ class GatewayRunner:
 
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice off state into a live platform adapter."""
+        setattr(adapter, "_auto_tts_globally_disabled", not getattr(self, "_voice_auto_tts_enabled", True))
         disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
         if not isinstance(disabled_chats, set):
             return
@@ -1193,6 +1653,22 @@ class GatewayRunner:
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
                 return bool(cfg.get("display", {}).get("show_reasoning", False))
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _load_voice_auto_tts_enabled() -> bool:
+        """Load the global auto-TTS master switch from config.yaml."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                voice_cfg = cfg.get("voice", {})
+                if isinstance(voice_cfg, dict):
+                    return bool(voice_cfg.get("auto_tts", False))
         except Exception:
             pass
         return False
@@ -1726,38 +2202,8 @@ class GatewayRunner:
         except Exception:
             pass
         
-        # Warn if no user allowlists are configured and open access is not opted in
-        _any_allowlist = any(
-            os.getenv(v)
-            for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
-                       "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
-                       "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
-                       "EMAIL_ALLOWED_USERS",
-                       "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
-                       "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
-                       "FEISHU_ALLOWED_USERS",
-                       "WECOM_ALLOWED_USERS",
-                       "WECOM_CALLBACK_ALLOWED_USERS",
-                       "WEIXIN_ALLOWED_USERS",
-                       "BLUEBUBBLES_ALLOWED_USERS",
-                       "QQ_ALLOWED_USERS",
-                       "GATEWAY_ALLOWED_USERS")
-        )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
-            os.getenv(v, "").lower() in ("true", "1", "yes")
-            for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
-                       "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
-                       "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
-                       "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
-                       "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
-                       "FEISHU_ALLOW_ALL_USERS",
-                       "WECOM_ALLOW_ALL_USERS",
-                       "WECOM_CALLBACK_ALLOW_ALL_USERS",
-                       "WEIXIN_ALLOW_ALL_USERS",
-                       "BLUEBUBBLES_ALLOW_ALL_USERS",
-                       "QQ_ALLOW_ALL_USERS")
-        )
-        if not _any_allowlist and not _allow_all:
+        # Warn only when neither env-based nor config-based access controls exist.
+        if _should_warn_about_missing_user_allowlists(self.config):
             logger.warning(
                 "No user allowlists configured. All unauthorized users will be denied. "
                 "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access, "
@@ -3249,26 +3695,39 @@ class GatewayRunner:
 
         _is_shared_thread = (
             source.chat_type != "dm"
-            and source.thread_id
-            and not getattr(self.config, "thread_sessions_per_user", False)
+            and (
+                (
+                    source.thread_id
+                    and not getattr(self.config, "thread_sessions_per_user", False)
+                )
+                or bool(getattr(source, "shared_session", False))
+            )
         )
         if _is_shared_thread and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
         if event.media_urls:
-            image_paths = []
+            import mimetypes as _mimetypes
+
+            image_entries = []
             audio_paths = []
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if mtype in ("", "application/octet-stream"):
+                    guessed, _ = _mimetypes.guess_type(path)
+                    if guessed:
+                        mtype = guessed
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
-                    image_paths.append(path)
+                    display_name = os.path.basename(str(path or "").split("?", 1)[0]) or "image"
+                    image_entries.append((i, _preferred_media_source(event, i, path, mtype), display_name))
                 if mtype.startswith("audio/") or event.message_type in (MessageType.VOICE, MessageType.AUDIO):
                     audio_paths.append(path)
 
-            if image_paths:
+            if image_entries:
                 message_text = await self._enrich_message_with_vision(
                     message_text,
-                    image_paths,
+                    image_entries,
+                    event=event,
                 )
 
             if audio_paths:
@@ -3305,10 +3764,16 @@ class GatewayRunner:
                         except Exception:
                             pass
 
-        if event.media_urls and event.message_type == MessageType.DOCUMENT:
-            import mimetypes as _mimetypes
-
+        if event.media_urls:
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            _JUHE_REMOTE_DOCUMENT_MIME_TYPES = {
+                "application/pdf",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-excel",
+            }
+            _JUHE_REMOTE_DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".xlsx", ".xls"}
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype in ("", "application/octet-stream"):
@@ -3321,6 +3786,42 @@ class GatewayRunner:
                         guessed, _ = _mimetypes.guess_type(path)
                         if guessed:
                             mtype = guessed
+                if source.platform == Platform.JUHE:
+                    import os as _juhe_os
+
+                    juhe_ext = _juhe_os.path.splitext(str(path or ""))[1].lower()
+                    preferred_source = _preferred_media_source(event, i, path, mtype)
+                    is_juhe_remote_document = (
+                        (
+                            str(mtype or "").strip().lower() in _JUHE_REMOTE_DOCUMENT_MIME_TYPES
+                            or juhe_ext in _JUHE_REMOTE_DOCUMENT_EXTENSIONS
+                        )
+                        and (
+                            str(path or "").startswith("juhe://")
+                            or preferred_source != path
+                        )
+                    )
+                    if is_juhe_remote_document:
+                        try:
+                            extracted_bundle = await document_text.build_remote_document_context_for_agent(
+                                media_ref=path,
+                                document_url=preferred_source,
+                                media_type=mtype,
+                                display_name=_juhe_os.path.basename(str(path or "")) or "document",
+                                session_db=getattr(self, "_session_db", None),
+                                cache_identity=_juhe_attachment_identity(event, i),
+                            )
+                        except Exception:
+                            logger.warning("Failed to build Juhe remote document context for %s", path, exc_info=True)
+                            extracted_bundle = None
+                        if extracted_bundle is not None:
+                            if extracted_bundle.display_description:
+                                _set_juhe_media_description(event, i, extracted_bundle.display_description)
+                            if extracted_bundle.agent_context:
+                                message_text = f"{extracted_bundle.agent_context}\n\n{message_text}"
+                            continue
+                    if is_juhe_remote_document:
+                        continue
                 if not mtype.startswith(("application/", "text/")):
                     continue
 
@@ -3387,6 +3888,299 @@ class GatewayRunner:
 
         return message_text
 
+    def _augment_agent_message_with_platform_context(
+        self,
+        *,
+        event: MessageEvent,
+        message_text: str,
+    ) -> str:
+        """Inject platform-specific transient context without polluting transcripts."""
+        parts: List[str] = []
+
+        room_memory = str(getattr(event, "_juhe_room_memory_text", "") or "").strip()
+        if room_memory:
+            parts.append(f"[Room memory]\n{room_memory}")
+
+        pending_context = str(getattr(event, "_juhe_pending_context_text", "") or "").strip()
+        if pending_context:
+            parts.append(f"[Recent room context]\n{pending_context}")
+
+        relevant_room_history = str(getattr(event, "_juhe_relevant_room_history_text", "") or "").strip()
+        if relevant_room_history:
+            parts.append(f"[Relevant room history]\n{relevant_room_history}")
+
+        relevant_prior_agent_turns = str(
+            getattr(event, "_juhe_relevant_prior_agent_turns_text", "") or ""
+        ).strip()
+        if relevant_prior_agent_turns:
+            parts.append(f"[Relevant prior agent turns]\n{relevant_prior_agent_turns}")
+
+        current_attachments = _build_current_juhe_attachment_context(event)
+        if current_attachments:
+            parts.append(current_attachments)
+
+        parts.append(message_text)
+        return "\n\n".join(part for part in parts if part)
+
+    def _should_surface_background_review(self, source: SessionSource) -> bool:
+        return source.platform != Platform.JUHE
+
+    def _maybe_apply_juhe_explicit_memory(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        message_text: str,
+        response_text: str,
+        memory_store: Any,
+        room_memory_char_limit: int,
+    ) -> str:
+        if (
+            source.platform != Platform.JUHE
+            or source.chat_type != "group"
+            or not str(message_text or "").strip()
+            or not str(response_text or "").strip()
+            or memory_store is None
+            or not is_explicit_memory_request(message_text)
+        ):
+            return response_text
+
+        from tools.memory_tool import memory_tool as _memory_tool
+
+        decision = route_memory_decision(
+            current_message=message_text,
+            assistant_response=response_text,
+            explicit=True,
+            chat_scope="group",
+            existing_room_memory=str(getattr(event, "_juhe_room_memory_text", "") or ""),
+            pending_context=str(getattr(event, "_juhe_pending_context_text", "") or ""),
+            relevant_room_history=str(getattr(event, "_juhe_relevant_room_history_text", "") or ""),
+            task="juhe_explicit_memory_review",
+        )
+        setattr(event, "_juhe_skip_auto_room_memory", True)
+
+        note = ""
+        if decision.target == "room" and decision.action != "skip":
+            result = apply_room_memory_decision(
+                source.chat_id,
+                decision,
+                char_limit=room_memory_char_limit,
+            )
+            if result.get("success"):
+                note = "已记到本群记忆。"
+        elif decision.target in {"user", "global"} and decision.action != "skip":
+            result_raw = _memory_tool(
+                action=decision.action,
+                target="user" if decision.target == "user" else "memory",
+                content=decision.content,
+                old_text=decision.match,
+                store=memory_store,
+            )
+            try:
+                result = json.loads(result_raw)
+            except (TypeError, json.JSONDecodeError):
+                result = {"success": False}
+            if result.get("success"):
+                note = "已记到你的协作偏好。" if decision.target == "user" else "已记到全局操作记忆。"
+
+        if note and note not in response_text:
+            return f"{response_text}\n\n{note}".strip()
+        return response_text
+
+    def _get_juhe_recall_config(self) -> Dict[str, Any]:
+        platforms = getattr(self.config, "platforms", {}) or {}
+        platform_config = platforms.get(Platform.JUHE) if isinstance(platforms, dict) else None
+        extra = getattr(platform_config, "extra", {}) if platform_config else {}
+        if not isinstance(extra, dict):
+            extra = {}
+        return {
+            "enabled": bool(extra.get("room_recall_enabled", True)),
+            "room_hit_limit": max(int(extra.get("room_recall_hit_limit", 4) or 4), 1),
+            "prior_hit_limit": max(int(extra.get("prior_session_recall_hit_limit", 4) or 4), 1),
+            "char_limit": max(int(extra.get("room_recall_char_limit", 1600) or 1600), 400),
+            "history_patterns": [
+                str(item).strip()
+                for item in (extra.get("history_question_patterns") or [])
+                if str(item).strip()
+            ] or [
+                "之前",
+                "以前",
+                "上次",
+                "刚才",
+                "有没有说过",
+                "还记得",
+                "是否聊过",
+                "那个",
+                "重新",
+            ],
+        }
+
+    @staticmethod
+    def _format_juhe_recall_timestamp(value: Any) -> str:
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return "unknown-time"
+
+    def _is_juhe_history_question(self, message_text: str, patterns: List[str]) -> bool:
+        text = str(message_text or "").strip().lower()
+        if not text:
+            return False
+        for pattern in patterns:
+            if pattern and pattern.lower() in text:
+                return True
+        return False
+
+    def _build_juhe_history_answer_rule(self, *, status: str) -> str:
+        if status == "hit":
+            return (
+                "History answer rule: explicit room-history hits were found. If the user asks whether this was "
+                "discussed before, answer that it was discussed and cite the absolute time plus a short summary."
+            )
+        if status == "no_match":
+            return (
+                "History answer rule: room-history recall completed but found no explicit matching record. "
+                "If the user asks whether this was discussed before, answer '当前未检到明确记录' and do not claim "
+                "it never happened."
+            )
+        return (
+            "History answer rule: automatic history recall did not produce a reliable result. "
+            "If the user asks whether this was discussed before, say '当前自动检索没拿到明确结果，不能确认没有'."
+        )
+
+    def _render_juhe_room_history_context(
+        self,
+        hits: List[Dict[str, Any]],
+        *,
+        char_limit: int,
+        status: str,
+    ) -> str:
+        lines: List[str] = [self._build_juhe_history_answer_rule(status=status)]
+        used = len(lines[0])
+        if status == "no_match":
+            lines.append("Recall status: current-room search completed and found no explicit matching record.")
+        elif status == "error":
+            lines.append("Recall status: current-room search degraded or unavailable for this turn.")
+        for item in hits:
+            line = (
+                f"{self._format_juhe_recall_timestamp(item.get('created_at'))} | "
+                f"{item.get('sender_name') or 'unknown'} | [Room history] "
+                f"{str(item.get('text_preview') or '').strip()}"
+            ).strip()
+            if len(lines) > 1 and used + len(line) > char_limit:
+                break
+            lines.append(line)
+            used += len(line)
+        return "\n".join(line for line in lines if line).strip()
+
+    def _render_juhe_prior_agent_turns_context(
+        self,
+        hits: List[Dict[str, Any]],
+        *,
+        char_limit: int,
+    ) -> str:
+        lines: List[str] = []
+        used = 0
+        for item in hits:
+            line = (
+                f"{self._format_juhe_recall_timestamp(item.get('timestamp'))} | "
+                f"{item.get('role') or 'unknown'} | [Prior agent turns] "
+                f"{str(item.get('content') or '').strip()}"
+            ).strip()
+            if not line:
+                continue
+            if lines and used + len(line) > char_limit:
+                break
+            lines.append(line)
+            used += len(line)
+        return "\n".join(lines)
+
+    def _attach_juhe_recall_context(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        session_entry,
+        message_text: str,
+        is_new_session: bool,
+    ) -> None:
+        setattr(event, "_juhe_relevant_room_history_text", "")
+        setattr(event, "_juhe_relevant_prior_agent_turns_text", "")
+
+        if (
+            source.platform != Platform.JUHE
+            or source.chat_type != "group"
+            or self._session_db is None
+        ):
+            return
+
+        recall_config = self._get_juhe_recall_config()
+        if not recall_config["enabled"]:
+            return
+
+        history_question = self._is_juhe_history_question(
+            message_text,
+            recall_config["history_patterns"],
+        )
+
+        room_hits: List[Dict[str, Any]] = []
+        room_status = "error"
+        try:
+            room_hits = self._session_db.search_room_history(
+                Platform.JUHE.value,
+                source.chat_id,
+                query=message_text,
+                limit=recall_config["room_hit_limit"],
+            )
+            current_message_id = str(getattr(event, "message_id", "") or "").strip()
+            if current_message_id:
+                room_hits = [
+                    item for item in room_hits
+                    if str(item.get("message_id") or "").strip() != current_message_id
+                ]
+            room_status = "hit" if room_hits else "no_match"
+        except Exception as exc:
+            logger.debug("Juhe room recall failed for %s: %s", source.chat_id, exc)
+
+        room_context = self._render_juhe_room_history_context(
+            room_hits,
+            char_limit=recall_config["char_limit"],
+            status=room_status,
+        )
+        if room_context and (room_hits or history_question):
+            setattr(event, "_juhe_relevant_room_history_text", room_context)
+
+        should_recall_prior_turns = history_question or (
+            is_new_session
+            and any(
+                marker in str(message_text or "")
+                for marker in ("之前", "以前", "上次", "刚才", "那个", "重新")
+            )
+        )
+        if not should_recall_prior_turns:
+            return
+
+        try:
+            prior_hits = self._session_db.search_prior_session_messages(
+                platform=Platform.JUHE.value,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                exclude_session_id=session_entry.session_id,
+                query=message_text,
+                limit=recall_config["prior_hit_limit"],
+            )
+        except Exception as exc:
+            logger.debug("Juhe prior-session recall failed for %s: %s", source.chat_id, exc)
+            prior_hits = []
+
+        prior_context = self._render_juhe_prior_agent_turns_context(
+            prior_hits,
+            char_limit=max(recall_config["char_limit"] // 2, 400),
+        )
+        if prior_context:
+            setattr(event, "_juhe_relevant_prior_agent_turns_text", prior_context)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -3419,7 +4213,7 @@ class GatewayRunner:
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(context, event=event)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -3839,6 +4633,17 @@ class GatewayRunner:
         )
         if message_text is None:
             return
+        self._attach_juhe_recall_context(
+            event=event,
+            source=source,
+            session_entry=session_entry,
+            message_text=message_text,
+            is_new_session=_is_new_session,
+        )
+        agent_message_text = self._augment_agent_message_with_platform_context(
+            event=event,
+            message_text=message_text,
+        )
 
         try:
             # Emit agent:start hook
@@ -3852,7 +4657,7 @@ class GatewayRunner:
 
             # Run the agent
             agent_result = await self._run_agent(
-                message=message_text,
+                message=agent_message_text,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -3941,6 +4746,22 @@ class GatewayRunner:
                     else:
                         display_reasoning = last_reasoning.strip()
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+
+            if response:
+                _juhe_adapter = self.adapters.get(source.platform)
+                _room_memory_char_limit = getattr(
+                    _juhe_adapter,
+                    "_room_memory_char_limit",
+                    2400,
+                )
+                response = self._maybe_apply_juhe_explicit_memory(
+                    event=event,
+                    source=source,
+                    message_text=message_text,
+                    response_text=response,
+                    memory_store=agent_result.get("memory_store"),
+                    room_memory_char_limit=_room_memory_char_limit,
+                )
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -5380,6 +6201,8 @@ class GatewayRunner:
         """
         if not response or response.startswith("Error:"):
             return False
+        if not getattr(self, "_voice_auto_tts_enabled", True):
+            return False
 
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(chat_id, "off")
@@ -5484,8 +6307,6 @@ class GatewayRunner:
         text itself is already delivered — this only handles file attachments
         that the normal _process_message_background path would have caught.
         """
-        from pathlib import Path
-
         try:
             media_files, _ = adapter.extract_media(response)
             _, cleaned = adapter.extract_images(response)
@@ -5499,7 +6320,7 @@ class GatewayRunner:
 
             for media_path, is_voice in media_files:
                 try:
-                    ext = Path(media_path).suffix.lower()
+                    ext = media_reference_suffix(media_path)
                     if ext in _AUDIO_EXTS:
                         await adapter.send_voice(
                             chat_id=event.source.chat_id,
@@ -5529,7 +6350,7 @@ class GatewayRunner:
 
             for file_path in local_files:
                 try:
-                    ext = Path(file_path).suffix.lower()
+                    ext = media_reference_suffix(file_path)
                     if ext in _IMAGE_EXTS:
                         await adapter.send_image_file(
                             chat_id=event.source.chat_id,
@@ -7289,7 +8110,7 @@ class GatewayRunner:
         finally:
             notify_path.unlink(missing_ok=True)
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(self, context: SessionContext, event: MessageEvent | None = None) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -7307,6 +8128,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            media_manifest=json.dumps(_build_session_media_manifest(event), ensure_ascii=False) if event is not None else "",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -7317,7 +8139,9 @@ class GatewayRunner:
     async def _enrich_message_with_vision(
         self,
         user_text: str,
-        image_paths: List[str],
+        image_entries: List[tuple[int, str, str]],
+        *,
+        event: MessageEvent | None = None,
     ) -> str:
         """
         Auto-analyze user-attached images with the vision tool and prepend
@@ -7330,49 +8154,97 @@ class GatewayRunner:
 
         Args:
             user_text:   The user's original caption / message text.
-            image_paths: List of local file paths to cached images.
+            image_entries: List of `(media_index, image_url, display_name)` tuples.
+            event: Optional inbound event for recording Juhe media descriptions.
 
         Returns:
             The enriched message string with vision descriptions prepended.
         """
-        from tools.vision_tools import vision_analyze_tool
-        import json as _json
-
-        analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, data, objects, people, layout, colors, "
-            "and any other notable visual information."
+        from gateway.juhe_attachment_processing import (
+            analyze_juhe_image_bundle,
+            build_image_agent_context,
+            bundle_from_cache_record,
         )
 
+        source_platform = getattr(getattr(event, "source", None), "platform", None)
+        is_juhe_event = source_platform == Platform.JUHE
+        session_db = getattr(self, "_session_db", None)
         enriched_parts = []
-        for path in image_paths:
+        for media_index, image_url, display_name in image_entries:
+            cache_identity = _juhe_attachment_identity(event, media_index) if event is not None else {}
+            media_type = ""
+            if event is not None:
+                media_types = getattr(event, "media_types", None) or []
+                if media_index < len(media_types):
+                    media_type = str(media_types[media_index] or "").strip()
+            bundle = None
+            if (
+                is_juhe_event
+                and session_db is not None
+                and cache_identity
+                and hasattr(session_db, "get_juhe_attachment_parse_cache")
+            ):
+                cached = session_db.get_juhe_attachment_parse_cache(platform="juhe", **cache_identity)
+                cached_bundle = bundle_from_cache_record(cached, display_name, default_kind="image")
+                if cached_bundle is not None and cached_bundle.parse_status == "success" and cached_bundle.extracted_text.strip():
+                    bundle = cached_bundle
             try:
-                logger.debug("Auto-analyzing user image: %s", path)
-                result_json = await vision_analyze_tool(
-                    image_url=path,
-                    user_prompt=analysis_prompt,
+                if bundle is None:
+                    logger.debug("Auto-analyzing user image: %s", display_name or "image")
+                    bundle = await analyze_juhe_image_bundle(
+                        image_url=image_url,
+                        display_name=display_name or "image",
+                    )
+                    if (
+                        is_juhe_event
+                        and session_db is not None
+                        and cache_identity
+                        and hasattr(session_db, "upsert_juhe_attachment_parse_cache")
+                    ):
+                        session_db.upsert_juhe_attachment_parse_cache(
+                            platform="juhe",
+                            media_type=media_type or "image/jpeg",
+                            file_name=bundle.display_name,
+                            parser=bundle.parser,
+                            extracted_text=bundle.extracted_text,
+                            content_kind=bundle.content_kind,
+                            content_format=bundle.content_format,
+                            display_description=bundle.display_description,
+                            parse_status=bundle.parse_status,
+                            error_message=bundle.error_message,
+                            **cache_identity,
+                        )
+                if event is not None:
+                    _set_juhe_media_description(
+                        event,
+                        media_index,
+                        bundle.display_description,
+                    )
+                enriched_parts.append(
+                    build_image_agent_context(
+                        bundle,
+                        is_juhe_event=is_juhe_event,
+                        image_url=image_url,
+                    )
                 )
-                result = _json.loads(result_json)
-                if result.get("success"):
-                    description = result.get("analysis", "")
+            except Exception as e:
+                logger.error("Vision auto-analysis error: %s", e)
+                if event is not None:
+                    _set_juhe_media_description(
+                        event,
+                        media_index,
+                        _build_image_media_description(display_name, ""),
+                    )
+                if is_juhe_event:
                     enriched_parts.append(
-                        f"[The user sent an image~ Here's what I can see:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
-                        f"image_url: {path} ~]"
+                        "[The user sent an image but something went wrong when I tried to look at it~]"
                     )
                 else:
                     enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
-                        "this time (>_<) You can try looking at it yourself "
-                        f"with vision_analyze using image_url: {path}]"
+                        f"[The user sent an image but something went wrong when I "
+                        f"tried to look at it~ You can try examining it yourself "
+                        f"with vision_analyze using image_url: {image_url}]"
                     )
-            except Exception as e:
-                logger.error("Vision auto-analysis error: %s", e)
-                enriched_parts.append(
-                    f"[The user sent an image but something went wrong when I "
-                    f"tried to look at it~ You can try examining it yourself "
-                    f"with vision_analyze using image_url: {path}]"
-                )
 
         # Combine: vision descriptions first, then the user's original text
         if enriched_parts:
@@ -8526,7 +9398,7 @@ class GatewayRunner:
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
-                if not _status_adapter:
+                if not _status_adapter or not self._should_surface_background_review(source):
                     return
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -8540,7 +9412,9 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("background_review_callback error: %s", _e)
 
-            agent.background_review_callback = _bg_review_send
+            agent.background_review_callback = (
+                _bg_review_send if self._should_surface_background_review(source) else None
+            )
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
@@ -8608,8 +9482,8 @@ class GatewayRunner:
                 if _hm.get("role") in ("tool", "function"):
                     _hc = _hm.get("content", "")
                     if "MEDIA:" in _hc:
-                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
-                            _p = _match.group(1).strip().rstrip('",}')
+                        _media_entries, _ = BasePlatformAdapter.extract_media(_hc)
+                        for _p, _is_voice in _media_entries:
                             if _p:
                                 _history_media_paths.add(_p)
             
@@ -8751,40 +9625,14 @@ class GatewayRunner:
                     "model": _resolved_model,
                 }
             
-            # Scan tool results for MEDIA:<path> tags that need to be delivered
-            # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
-            # in its JSON response, but the model's final text reply usually
-            # doesn't include them.  We collect unique tags from tool results and
-            # append any that aren't already present in the final response, so the
-            # adapter's extract_media() can find and deliver the files exactly once.
-            #
-            # Uses path-based deduplication against _history_media_paths (collected
-            # before run_conversation) instead of index slicing. This is safe even
-            # when context compression shrinks the message list. (Fixes #160)
-            if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in ("tool", "function"):
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
-                
-                if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+            # Promote tool-result delivery artifacts into MEDIA tags so the
+            # adapter can send native attachments even when the model only
+            # references structured download URLs in its visible reply.
+            final_response = _augment_final_response_with_tool_media(
+                final_response,
+                result.get("messages", []),
+                _history_media_paths,
+            )
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -8840,6 +9688,7 @@ class GatewayRunner:
                 "model": _resolved_model,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                "memory_store": getattr(agent, "_memory_store", None),
             }
         
         # Start progress message sender if enabled
@@ -9172,7 +10021,7 @@ class GatewayRunner:
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     pending = result.get("interrupt_message")
                 elif pending_event:
-                    pending = pending_event.text or _build_media_placeholder(pending_event)
+                    pending = _pending_event_preview_text(pending_event)
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
@@ -9285,6 +10134,10 @@ class GatewayRunner:
                     )
                     if next_message is None:
                         return result
+                    next_message = self._augment_agent_message_with_platform_context(
+                        event=pending_event,
+                        message_text=next_message,
+                    )
                     next_message_id = getattr(pending_event, "message_id", None)
 
                 return await self._run_agent(

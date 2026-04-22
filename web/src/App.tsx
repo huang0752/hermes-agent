@@ -1,4 +1,4 @@
-import { Routes, Route, NavLink, Navigate } from "react-router-dom";
+import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
 import { Activity, BarChart3, Clock, FileText, KeyRound, MessageSquare, Package, Settings } from "lucide-react";
 import StatusPage from "@/pages/StatusPage";
 import ConfigPage from "@/pages/ConfigPage";
@@ -8,6 +8,7 @@ import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import CronPage from "@/pages/CronPage";
 import SkillsPage from "@/pages/SkillsPage";
+import JuheWorkspacePage from "@/pages/JuheWorkspacePage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { useI18n } from "@/i18n";
 
@@ -23,7 +24,17 @@ const NAV_ITEMS = [
 ] as const;
 
 export default function App() {
+  const location = useLocation();
   const { t } = useI18n();
+
+  if (location.pathname.startsWith("/juhe")) {
+    return (
+      <Routes>
+        <Route path="/juhe" element={<JuheWorkspacePage />} />
+        <Route path="*" element={<Navigate to="/juhe" replace />} />
+      </Routes>
+    );
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground overflow-x-hidden">

@@ -2022,6 +2022,41 @@ async def get_usage_analytics(days: int = 30):
         db.close()
 
 
+@app.get("/api/juhe/conversations")
+async def get_juhe_conversations(query: str = "", limit: int = 200):
+    from hermes_cli.juhe_readonly import list_group_conversations
+
+    return list_group_conversations(query=query, limit=limit)
+
+
+@app.get("/api/juhe/conversations/{conversation_id}")
+async def get_juhe_conversation_detail(conversation_id: str):
+    from hermes_cli.juhe_readonly import get_group_conversation_detail
+
+    payload = get_group_conversation_detail(conversation_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Juhe group conversation not found")
+    return payload
+
+
+@app.get("/api/juhe/conversations/{conversation_id}/messages")
+async def get_juhe_conversation_messages(
+    conversation_id: str,
+    before_message_id: str | None = None,
+    limit: int = 50,
+):
+    from hermes_cli.juhe_readonly import get_group_messages
+
+    payload = get_group_messages(
+        conversation_id,
+        before_message_id=before_message_id,
+        limit=limit,
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Juhe group conversation not found")
+    return payload
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 

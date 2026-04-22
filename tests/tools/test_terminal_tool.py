@@ -88,3 +88,15 @@ def test_cached_sudo_password_is_used_when_env_is_unset(monkeypatch):
 
     assert transformed == "echo ok && sudo -S -p '' whoami"
     assert sudo_stdin == "cached-pass\n"
+
+
+def test_certificate_render_job_downloads_are_not_hard_blocked():
+    command = (
+        'curl -sL -o /tmp/certificates.zip '
+        '"http://49.233.103.196:9000/certificate-dev/certificaterenderjobs/'
+        '2026/04/22/job-92/certificates.zip?AWSAccessKeyId=minioadmin&Signature=abc"'
+    )
+
+    decision = terminal_tool._check_certificate_delivery_download(command)
+
+    assert decision is None

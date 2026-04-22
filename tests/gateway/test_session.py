@@ -323,6 +323,28 @@ class TestBuildSessionContextPrompt:
         # Should NOT show a specific **User:** line (would bust cache)
         assert "**User:** Alice" not in prompt
 
+    def test_shared_group_prompt_omits_user_when_source_marked_shared_session(self):
+        """Shared non-thread group sessions should also present as multi-user."""
+        config = GatewayConfig(
+            platforms={
+                Platform.JUHE: PlatformConfig(enabled=True, extra={"app_key": "app", "app_secret": "secret", "guid": "guid"}),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="R:2001",
+            chat_name="Customer Room",
+            chat_type="group",
+            user_name="Alice",
+        )
+        setattr(source, "shared_session", True)
+
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Multi-user thread" in prompt
+        assert "**User:** Alice" not in prompt
+
     def test_non_thread_group_shows_user(self):
         """Regular group messages (no thread) still show the user name."""
         config = GatewayConfig(
@@ -590,6 +612,50 @@ class TestSessionStoreSwitchSession:
         assert resumed["end_reason"] is None
         db.close()
 
+    def test_get_or_create_session_persists_juhe_room_metadata_into_sqlite(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig(
+            group_sessions_per_user=True,
+            platforms={
+                Platform.JUHE: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_key": "app",
+                        "app_secret": "secret",
+                        "guid": "guid",
+                        "group_sessions_per_user": False,
+                    },
+                )
+            },
+        )
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="R:2001",
+            chat_type="group",
+            user_id="1001",
+            user_name="Alice",
+        )
+
+        entry = store.get_or_create_session(source)
+        session = db.get_session(entry.session_id)
+
+        assert session is not None
+        assert session["platform"] == "juhe"
+        assert session["chat_id"] == "R:2001"
+        assert session["chat_type"] == "group"
+        assert session["thread_id"] is None
+        assert session["session_key"] == "agent:main:juhe:group:R:2001"
+        assert session["shared_session"] == 1
+
+        db.close()
+
 
 class TestWhatsAppDMSessionKeyConsistency:
     """Regression: all session-key construction must go through build_session_key
@@ -735,6 +801,47 @@ class TestWhatsAppDMSessionKeyConsistency:
 
         assert build_session_key(first, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
         assert build_session_key(second, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
+
+    def test_store_honors_juhe_platform_group_session_override(self, tmp_path):
+        config = GatewayConfig(
+            group_sessions_per_user=True,
+            platforms={
+                Platform.JUHE: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "app_key": "app",
+                        "app_secret": "secret",
+                        "guid": "guid",
+                        "group_sessions_per_user": False,
+                    },
+                )
+            },
+        )
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        first = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="R:2001",
+            chat_type="group",
+            user_id="alice",
+            user_name="Alice",
+        )
+        second = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="R:2001",
+            chat_type="group",
+            user_id="bob",
+            user_name="Bob",
+        )
+
+        first_entry = store.get_or_create_session(first)
+        second_entry = store.get_or_create_session(second)
+
+        assert first_entry.session_key == "agent:main:juhe:group:R:2001"
+        assert second_entry.session_key == "agent:main:juhe:group:R:2001"
+        assert first_entry.session_id == second_entry.session_id
 
     def test_group_thread_includes_thread_id(self):
         """Forum-style threads need a distinct session key within one group."""

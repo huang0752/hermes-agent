@@ -1,0 +1,71 @@
+{
+  "name": "group-shared-session",
+  "description": "客户消息先进入群上下文池，等到有触发权限的员工发言后再正式进入同一个群 session。",
+  "mode": "gateway",
+  "env": {
+    "JUHE_HOME_CHANNEL": "R:2001"
+  },
+  "agent": {
+    "mode": "mock"
+  },
+  "adapter_extra": {
+    "app_key": "app-key",
+    "app_secret": "app-secret",
+    "guid": "guid-123",
+    "group_policy": "allowlist",
+    "group_allow_from": [
+      "R:2001"
+    ],
+    "trigger_user_ids": [
+      "1001"
+    ],
+    "group_sessions_per_user": false,
+    "room_log_limit": 500,
+    "pending_context_limit": 20
+  },
+  "steps": [
+    {
+      "name": "customer backlog",
+      "message": {
+        "sender": "1002",
+        "sender_name": "客户张三",
+        "roomid": "2001",
+        "id": "room-msg-1",
+        "content": "Earlier customer context"
+      },
+      "expect": {
+        "dispatched": false,
+        "room_history_size": 1
+      }
+    },
+    {
+      "name": "authorized trigger user",
+      "message": {
+        "sender": "1001",
+        "sender_name": "员工A",
+        "roomid": "2001",
+        "id": "room-msg-2",
+        "at_list": [
+          "bot"
+        ],
+        "content": "请整理一下刚才的需求"
+      },
+      "agent": {
+        "final_response": "收到，我来整理刚才群里确认的需求。"
+      },
+      "expect": {
+        "dispatched": true,
+        "agent_called": true,
+        "session_key": "agent:main:juhe:group:R:2001",
+        "outbound_count": 1,
+        "pending_context_contains": "Earlier customer context",
+        "agent_message_contains": [
+          "[Recent room context]",
+          "[员工A] 请整理一下刚才的需求"
+        ],
+        "final_response_contains": "群里确认的需求",
+        "room_history_size": 2
+      }
+    }
+  ]
+}

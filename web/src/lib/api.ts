@@ -44,6 +44,29 @@ export const api = {
     fetchJSON<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
+  getJuheConversations: (params?: { query?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.query) qs.set("query", params.query);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString();
+    return fetchJSON<JuheConversationsResponse>(`/api/juhe/conversations${suffix ? `?${suffix}` : ""}`);
+  },
+  getJuheConversationDetail: (conversationId: string) =>
+    fetchJSON<JuheConversationDetailResponse>(
+      `/api/juhe/conversations/${encodeURIComponent(conversationId)}`,
+    ),
+  getJuheConversationMessages: (
+    conversationId: string,
+    params?: { beforeMessageId?: string; limit?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params?.beforeMessageId) qs.set("before_message_id", params.beforeMessageId);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString();
+    return fetchJSON<JuheConversationMessagesResponse>(
+      `/api/juhe/conversations/${encodeURIComponent(conversationId)}/messages${suffix ? `?${suffix}` : ""}`,
+    );
+  },
   getLogs: (params: { file?: string; lines?: number; level?: string; component?: string }) => {
     const qs = new URLSearchParams();
     if (params.file) qs.set("file", params.file);
@@ -257,6 +280,64 @@ export interface SessionMessage {
 export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessage[];
+}
+
+export interface JuheConversationSummary {
+  conversation_id: string;
+  room_id: string;
+  title: string;
+  member_count: number | null;
+  last_message_id: string | null;
+  last_message_preview: string | null;
+  last_message_sender_name: string | null;
+  last_message_at: number | null;
+  last_message_type: number | null;
+  last_message_type_label: string | null;
+  has_messages: boolean;
+}
+
+export interface JuheConversationMember {
+  uin?: string;
+  nickname?: string;
+  [key: string]: unknown;
+}
+
+export interface JuheRoomMemory {
+  exists: boolean;
+  path: string | null;
+  content: string;
+}
+
+export interface JuheMessageItem {
+  id: string;
+  message_id: string | null;
+  timestamp: number;
+  direction: string;
+  sender_id: string | null;
+  sender_name: string | null;
+  message_type: number;
+  message_type_label: string;
+  preview: string;
+  text: string | null;
+  is_text: boolean;
+}
+
+export interface JuheConversationsResponse {
+  conversations: JuheConversationSummary[];
+  query: string;
+  total: number;
+}
+
+export interface JuheConversationDetailResponse {
+  conversation: JuheConversationSummary;
+  members: JuheConversationMember[];
+  room_memory: JuheRoomMemory;
+}
+
+export interface JuheConversationMessagesResponse {
+  conversation_id: string;
+  messages: JuheMessageItem[];
+  has_more: boolean;
 }
 
 export interface LogsResponse {

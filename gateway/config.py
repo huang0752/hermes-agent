@@ -395,6 +395,26 @@ class GatewayConfig:
             try:
                 platform = Platform(platform_name)
                 platforms[platform] = PlatformConfig.from_dict(platform_data)
+                if platform == Platform.JUHE:
+                    platforms[platform].extra.setdefault("group_sessions_per_user", False)
+                    platforms[platform].extra.setdefault("room_recall_enabled", True)
+                    platforms[platform].extra.setdefault("room_recall_hit_limit", 4)
+                    platforms[platform].extra.setdefault("prior_session_recall_hit_limit", 4)
+                    platforms[platform].extra.setdefault("room_recall_char_limit", 1600)
+                    platforms[platform].extra.setdefault(
+                        "history_question_patterns",
+                        [
+                            "之前",
+                            "以前",
+                            "上次",
+                            "刚才",
+                            "有没有说过",
+                            "还记得",
+                            "是否聊过",
+                            "那个",
+                            "重新",
+                        ],
+                    )
             except ValueError:
                 pass  # Skip unknown platforms
         
@@ -1098,6 +1118,25 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "dm_policy": "allowlist",
             "group_policy": "allowlist",
         })
+        config.platforms[Platform.JUHE].extra.setdefault("group_sessions_per_user", False)
+        config.platforms[Platform.JUHE].extra.setdefault("room_recall_enabled", True)
+        config.platforms[Platform.JUHE].extra.setdefault("room_recall_hit_limit", 4)
+        config.platforms[Platform.JUHE].extra.setdefault("prior_session_recall_hit_limit", 4)
+        config.platforms[Platform.JUHE].extra.setdefault("room_recall_char_limit", 1600)
+        config.platforms[Platform.JUHE].extra.setdefault(
+            "history_question_patterns",
+            [
+                "之前",
+                "以前",
+                "上次",
+                "刚才",
+                "有没有说过",
+                "还记得",
+                "是否聊过",
+                "那个",
+                "重新",
+            ],
+        )
         juhe_base_url = os.getenv("JUHE_BASE_URL", "").strip()
         if juhe_base_url:
             config.platforms[Platform.JUHE].extra["base_url"] = juhe_base_url.rstrip("/")
@@ -1173,6 +1212,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         juhe_inbound_addressing_style = os.getenv("JUHE_INBOUND_S3_ADDRESSING_STYLE", "").strip().lower()
         if juhe_inbound_addressing_style:
             config.platforms[Platform.JUHE].extra["inbound_s3_addressing_style"] = juhe_inbound_addressing_style
+        juhe_inbound_s3_expires = os.getenv("JUHE_INBOUND_S3_URL_EXPIRES_SECONDS", "").strip()
+        if juhe_inbound_s3_expires:
+            try:
+                config.platforms[Platform.JUHE].extra["inbound_s3_url_expires_seconds"] = int(
+                    juhe_inbound_s3_expires
+                )
+            except ValueError:
+                pass
         juhe_ws_url = os.getenv("JUHE_WEBSOCKET_URL", "").strip()
         if juhe_ws_url:
             config.platforms[Platform.JUHE].extra["websocket_url"] = juhe_ws_url.rstrip("/")
@@ -1182,6 +1229,33 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         juhe_groups = os.getenv("JUHE_GROUP_ALLOWED_CHATS", "").strip()
         if juhe_groups:
             config.platforms[Platform.JUHE].extra["group_allow_from"] = juhe_groups
+        juhe_trigger_users = os.getenv("JUHE_TRIGGER_USER_IDS", "").strip()
+        if juhe_trigger_users:
+            config.platforms[Platform.JUHE].extra["trigger_user_ids"] = juhe_trigger_users
+        juhe_group_sessions_per_user = os.getenv("JUHE_GROUP_SESSIONS_PER_USER", "").strip()
+        if juhe_group_sessions_per_user:
+            config.platforms[Platform.JUHE].extra["group_sessions_per_user"] = _coerce_bool(
+                juhe_group_sessions_per_user,
+                False,
+            )
+        juhe_room_log_limit = os.getenv("JUHE_ROOM_LOG_LIMIT", "").strip()
+        if juhe_room_log_limit:
+            try:
+                config.platforms[Platform.JUHE].extra["room_log_limit"] = int(juhe_room_log_limit)
+            except ValueError:
+                pass
+        juhe_pending_context_limit = os.getenv("JUHE_PENDING_CONTEXT_LIMIT", "").strip()
+        if juhe_pending_context_limit:
+            try:
+                config.platforms[Platform.JUHE].extra["pending_context_limit"] = int(juhe_pending_context_limit)
+            except ValueError:
+                pass
+        juhe_room_memory_char_limit = os.getenv("JUHE_ROOM_MEMORY_CHAR_LIMIT", "").strip()
+        if juhe_room_memory_char_limit:
+            try:
+                config.platforms[Platform.JUHE].extra["room_memory_char_limit"] = int(juhe_room_memory_char_limit)
+            except ValueError:
+                pass
         juhe_home = os.getenv("JUHE_HOME_CHANNEL", "").strip()
         if juhe_home:
             config.platforms[Platform.JUHE].home_channel = HomeChannel(

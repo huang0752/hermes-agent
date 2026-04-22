@@ -529,8 +529,9 @@ MEMORY_SCHEMA = {
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"
-        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'user': who the primary user is -- name, role, preferences, communication style, pet peeves\n"
+        "- 'memory': global notes -- environment facts, platform constraints, project conventions, tool quirks, lessons learned\n"
+        "- Do NOT use built-in memory for room-specific group shorthand or one room's private conventions.\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
@@ -578,7 +579,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

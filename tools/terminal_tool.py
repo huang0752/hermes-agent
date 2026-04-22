@@ -151,6 +151,10 @@ def _check_all_guards(command: str, env_type: str) -> dict:
 # Covers alphanumeric, path separators, tilde, dot, hyphen, underscore, space,
 # plus, at, equals, and comma.  Everything else is rejected.
 _WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/_\-.~ +@=,]+$')
+_CERTIFICATE_RENDER_DOWNLOAD_RE = re.compile(
+    r"(?is)\b(?:curl|wget)\b.*?"
+    r"https?://[^\s\"']+/(?:certificate_render_jobs|certificaterenderjobs)/[^\s\"']+\.zip(?:\?[^\s\"']*)?"
+)
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -173,6 +177,27 @@ def _validate_workdir(workdir: str) -> str | None:
                 )
         return "Blocked: workdir contains disallowed characters."
     return None
+
+
+def _check_certificate_delivery_download(command: str) -> dict | None:
+    """Block certificate render-job zip downloads in terminal flows.
+
+    Delivery artifacts should flow through MEDIA tags / platform delivery,
+    not raw shell downloads that can trigger approval guards or leak links.
+    """
+    normalized = (command or "").strip()
+    if not normalized:
+        return None
+    if not _CERTIFICATE_RENDER_DOWNLOAD_RE.search(normalized):
+        return None
+    return {
+        "status": "blocked",
+        "message": (
+            "Certificate render artifact is already ready for delivery. "
+            "Do not use terminal, curl, or wget to download it. "
+            "Use the existing MEDIA tag or structured delivery result instead."
+        ),
+    }
 
 
 def _handle_sudo_failure(output: str, env_type: str) -> str:
@@ -1286,6 +1311,18 @@ def terminal_tool(
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
+            certificate_delivery_block = _check_certificate_delivery_download(command)
+            if certificate_delivery_block is not None:
+                logger.warning(
+                    "Blocked certificate delivery download via terminal: %s",
+                    _safe_command_preview(command),
+                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": certificate_delivery_block["message"],
+                    "status": certificate_delivery_block["status"],
+                }, ensure_ascii=False)
             approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -846,6 +847,65 @@ class TestAuxiliaryPoolAwareness:
         assert model == "gemini-3.1-pro-preview"
         assert mock_openai.call_args.kwargs["api_key"] == "gemini-key"
         assert mock_openai.call_args.kwargs["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    def test_juhe_media_task_uses_task_specific_vision_override(self, monkeypatch):
+        config = {
+            "auxiliary": {
+                "juhe_media": {
+                    "provider": "google",
+                    "model": "gemini-3.1-pro-preview",
+                }
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        with (
+            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
+                "api_key": "gemini-key",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            }),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            resolved_provider, client, model = resolve_vision_provider_client(task="juhe_media")
+
+        assert resolved_provider == "gemini"
+        assert client is not None
+        assert model == "gemini-3.1-pro-preview"
+        assert mock_openai.call_args.kwargs["api_key"] == "gemini-key"
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_routes_juhe_media_through_vision_backends(self, caplog):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", None, None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("alibaba", client, "qwen3.6-plus"),
+            ) as vision_mock,
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                side_effect=AssertionError("text-client routing must not handle juhe_media vision tasks"),
+            ),
+            caplog.at_level(logging.INFO, logger="agent.auxiliary_client"),
+        ):
+            result = await async_call_llm(
+                task="juhe_media",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "describe"}]}],
+            )
+
+        assert result is response
+        vision_mock.assert_called_once()
+        assert any(
+            "Auxiliary juhe_media (async): using alibaba (qwen3.6-plus)" in rec.message
+            for rec in caplog.records
+        )
 
 
 

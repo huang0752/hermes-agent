@@ -292,6 +292,7 @@ class TestBuiltinDiscovery:
     def test_matches_previous_manual_builtin_tool_set(self):
         expected = {
             "tools.browser_tool",
+            "tools.certificate_workflow_tool",
             "tools.clarify_tool",
             "tools.code_execution_tool",
             "tools.cronjob_tools",
@@ -299,6 +300,7 @@ class TestBuiltinDiscovery:
             "tools.file_tools",
             "tools.homeassistant_tool",
             "tools.image_generation_tool",
+            "tools.juhe_tool",
             "tools.memory_tool",
             "tools.mixture_of_agents_tool",
             "tools.process_registry",

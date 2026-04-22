@@ -58,6 +58,8 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message", "juhe_tool",
+    # Certificate workflow wrapper
+    "certificate_workflow_tool",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
@@ -129,6 +131,12 @@ TOOLSETS = {
     "messaging": {
         "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
         "tools": ["send_message", "juhe_tool"],
+        "includes": []
+    },
+
+    "certificate": {
+        "description": "Certificate admin workflow wrapper for archive prep and certificate delivery",
+        "tools": ["certificate_workflow_tool"],
         "includes": []
     },
     
@@ -237,6 +245,7 @@ TOOLSETS = {
             "browser_vision", "browser_console",
             "todo", "memory",
             "session_search",
+            "certificate_workflow_tool",
             "execute_code", "delegate_task",
         ],
         "includes": []
@@ -264,6 +273,8 @@ TOOLSETS = {
             "todo", "memory",
             # Session history search
             "session_search",
+            # Certificate workflow
+            "certificate_workflow_tool",
             # Code execution + delegation
             "execute_code", "delegate_task",
             # Cronjob management

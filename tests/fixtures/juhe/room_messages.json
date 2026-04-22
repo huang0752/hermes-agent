@@ -1,0 +1,48 @@
+{
+  "R:2001": [
+    {
+      "message_id": "msg-1",
+      "sender_id": "1001",
+      "sender_name": "Alice",
+      "message_type": 2,
+      "text_preview": "hello",
+      "created_at": 100.0
+    },
+    {
+      "message_id": "msg-2",
+      "sender_id": "1002",
+      "sender_name": "Bob",
+      "message_type": 5,
+      "text_preview": "[图片] screenshot.png",
+      "created_at": 200.0
+    },
+    {
+      "message_id": "msg-3",
+      "sender_id": "1001",
+      "sender_name": "Alice",
+      "message_type": 2,
+      "text_preview": "latest",
+      "created_at": 300.0
+    }
+  ],
+  "R:2002": [
+    {
+      "message_id": "room-msg-2",
+      "sender_id": "2002",
+      "sender_name": "Evan",
+      "message_type": 2,
+      "text_preview": "latest room message",
+      "created_at": 400.0
+    }
+  ],
+  "S:1001": [
+    {
+      "message_id": "dm-msg-1",
+      "sender_id": "1001",
+      "sender_name": "Alice",
+      "message_type": 2,
+      "text_preview": "dm should be excluded",
+      "created_at": 300.0
+    }
+  ]
+}

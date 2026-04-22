@@ -1,0 +1,166 @@
+{
+  "name": "group-complex-requirement-flow",
+  "description": "更长的客户群需求讨论流程，包含多轮未触发上下文、两次正式触发和方案更新。",
+  "mode": "gateway",
+  "env": {
+    "JUHE_HOME_CHANNEL": "R:4101"
+  },
+  "agent": {
+    "mode": "mock"
+  },
+  "adapter_extra": {
+    "app_key": "app-key",
+    "app_secret": "app-secret",
+    "guid": "guid-123",
+    "group_policy": "allowlist",
+    "group_allow_from": [
+      "R:4101"
+    ],
+    "trigger_user_ids": [
+      "1001"
+    ],
+    "group_sessions_per_user": false,
+    "room_log_limit": 500,
+    "pending_context_limit": 20
+  },
+  "steps": [
+    {
+      "name": "customer initial requirement",
+      "message": {
+        "sender": "2001",
+        "sender_name": "客户王总",
+        "roomid": "4101",
+        "id": "complex-msg-1",
+        "content": "我们这周想先做一个售后工单看板，首页先看待响应、处理中、已完成三个状态。"
+      },
+      "expect": {
+        "dispatched": false,
+        "agent_called": false,
+        "room_history_size": 1
+      }
+    },
+    {
+      "name": "customer adds filters",
+      "message": {
+        "sender": "2002",
+        "sender_name": "客户产品经理",
+        "roomid": "4101",
+        "id": "complex-msg-2",
+        "content": "筛选项至少要有客户名称、负责人、优先级，还要能筛最近7天和最近30天。"
+      },
+      "expect": {
+        "dispatched": false,
+        "agent_called": false,
+        "room_history_size": 2
+      }
+    },
+    {
+      "name": "customer adds export and reminder",
+      "message": {
+        "sender": "2003",
+        "sender_name": "客户运营",
+        "roomid": "4101",
+        "id": "complex-msg-3",
+        "content": "第一期希望支持导出 Excel，另外超时未响应的工单最好有明显提醒。"
+      },
+      "expect": {
+        "dispatched": false,
+        "agent_called": false,
+        "room_history_size": 3
+      }
+    },
+    {
+      "name": "non trigger user mentions bot",
+      "message": {
+        "sender": "2004",
+        "sender_name": "客户实施",
+        "roomid": "4101",
+        "id": "complex-msg-4",
+        "at_list": [
+          "bot"
+        ],
+        "content": "@bot 移动端这期先不用，PC 端能先跑起来就行。"
+      },
+      "expect": {
+        "dispatched": false,
+        "agent_called": false,
+        "room_history_size": 4
+      }
+    },
+    {
+      "name": "authorized trigger user asks for structured summary",
+      "message": {
+        "sender": "1001",
+        "sender_name": "员工A",
+        "roomid": "4101",
+        "id": "complex-msg-5",
+        "at_list": [
+          "bot"
+        ],
+        "content": "请基于上面讨论，整理一版群里可直接确认的需求方案，分成已确认需求、待确认问题、建议第一期范围、下一步行动。"
+      },
+      "agent": {
+        "final_response": "我先整理一版可直接群内确认的方案：\n\n1. 已确认需求\n- 看板首页先展示待响应、处理中、已完成三个状态。\n- 支持按客户名称、负责人、优先级筛选。\n- 时间范围先支持最近7天、最近30天。\n- 第一期开通 Excel 导出。\n- 超时未响应工单需要明显提醒。\n- 本期先做 PC 端，不做移动端。\n\n2. 待确认问题\n- Excel 导出的字段明细是否需要和列表完全一致。\n- 超时提醒的判定阈值是按分钟、小时还是自然日。\n- 首页是否需要按负责人做默认视角。\n\n3. 建议第一期范围\n- 先做列表看板、筛选、状态统计、超时高亮、Excel 导出。\n- 暂不做移动端、复杂权限联动、外部 BI 对接。\n\n4. 下一步行动\n- 建议今天在群里先确认导出字段和超时口径。\n- 确认后我可以再整理成产品需求清单和开发拆分。"
+      },
+      "expect": {
+        "dispatched": true,
+        "agent_called": true,
+        "session_key": "agent:main:juhe:group:R:4101",
+        "outbound_count": 1,
+        "pending_context_contains": [
+          "售后工单看板",
+          "最近7天和最近30天",
+          "移动端这期先不用"
+        ],
+        "agent_message_contains": [
+          "[Recent room context]",
+          "[员工A] 请基于上面讨论"
+        ],
+        "room_history_size": 5
+      }
+    },
+    {
+      "name": "customer adds new integration constraint",
+      "message": {
+        "sender": "2002",
+        "sender_name": "客户产品经理",
+        "roomid": "4101",
+        "id": "complex-msg-6",
+        "content": "补充一点，第一期先不要接外部 BI，也先不做自动派单。"
+      },
+      "expect": {
+        "dispatched": false,
+        "agent_called": false,
+        "room_history_size": 6
+      }
+    },
+    {
+      "name": "authorized trigger user asks for updated v2 summary",
+      "message": {
+        "sender": "1001",
+        "sender_name": "员工A",
+        "roomid": "4101",
+        "id": "complex-msg-7",
+        "at_list": [
+          "bot"
+        ],
+        "content": "把刚才方案更新成 v2，明确排除项，并补一句当前最需要客户确认的三件事。"
+      },
+      "agent": {
+        "final_response": "我把方案更新成 v2，方便群里直接确认：\n\n1. 当前已确认范围\n- 首页展示待响应、处理中、已完成。\n- 筛选包含客户名称、负责人、优先级、最近7天、最近30天。\n- 第一期开通 Excel 导出。\n- 超时未响应工单做高亮提醒。\n- 仅做 PC 端。\n\n2. 当前明确排除项\n- 第一期开外部 BI 对接先不做。\n- 自动派单先不做。\n- 移动端先不做。\n\n3. 当前最需要客户确认的三件事\n- Excel 导出字段清单。\n- 超时提醒的判定口径。\n- 是否需要负责人默认视角。\n\n如果这三项确认下来，我下一步可以直接整理成产品清单和开发任务拆分。"
+      },
+      "expect": {
+        "dispatched": true,
+        "agent_called": true,
+        "session_key": "agent:main:juhe:group:R:4101",
+        "outbound_count": 1,
+        "pending_context_contains": "先不要接外部 BI",
+        "agent_message_contains": [
+          "[Recent room context]",
+          "[员工A] 把刚才方案更新成 v2"
+        ],
+        "room_history_size": 7
+      }
+    }
+  ]
+}

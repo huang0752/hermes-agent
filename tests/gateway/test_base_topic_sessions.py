@@ -48,6 +48,56 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 
+class DummyJuheAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.JUHE)
+        self.sent = []
+        self.documents = []
+        self.processing_hooks = []
+
+    async def connect(self) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="text-1")
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None) -> SendResult:
+        self.documents.append(
+            {
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+                "file_name": file_name,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="doc-1")
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id: str):
+        return {"id": chat_id}
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        self.processing_hooks.append(("start", event.message_id))
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        self.processing_hooks.append(("complete", event.message_id, outcome))
+
+
 def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageEvent:
     return MessageEvent(
         text="hello",
@@ -56,6 +106,18 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
             chat_id=chat_id,
             chat_type="group",
             thread_id=thread_id,
+        ),
+        message_id=message_id,
+    )
+
+
+def _make_juhe_event(chat_id: str = "R:1001", message_id: str = "1") -> MessageEvent:
+    return MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.JUHE,
+            chat_id=chat_id,
+            chat_type="group",
         ),
         message_id=message_id,
     )
@@ -169,6 +231,40 @@ class TestBasePlatformTopicSessions:
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+
+class TestJuheDocumentDeliveryOrdering:
+    @pytest.mark.asyncio
+    async def test_process_message_background_sends_document_before_text_for_juhe(self):
+        adapter = DummyJuheAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "证书压缩包已就绪：\nreport.zip\nMEDIA:/tmp/report.zip"
+
+        adapter.set_message_handler(handler)
+
+        event = _make_juhe_event()
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.documents == [
+            {
+                "chat_id": "R:1001",
+                "file_path": "/tmp/report.zip",
+                "caption": None,
+                "file_name": None,
+                "reply_to": None,
+                "metadata": None,
+            }
+        ]
+        assert adapter.sent == [
+            {
+                "chat_id": "R:1001",
+                "content": "证书压缩包已就绪：\nreport.zip",
+                "reply_to": "1",
+                "metadata": None,
+            }
         ]
 
     @pytest.mark.asyncio

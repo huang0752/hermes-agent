@@ -90,6 +90,12 @@ class TestCleanForDisplay:
         # But "media:" is lowercase so won't match either
         assert result == text
 
+    def test_preserves_media_tag_label_text(self):
+        """Instructional text mentioning 'MEDIA: tag' must not be stripped."""
+        text = "including any delivery MEDIA: tag produced by the wrapper."
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert result == text
+
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 

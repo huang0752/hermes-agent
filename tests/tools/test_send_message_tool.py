@@ -356,6 +356,58 @@ class TestSendMessageTool:
             media_files=[("https://files.example.com/report.pdf", False)],
         )
 
+    def test_juhe_certificate_render_job_links_in_plain_text_are_forwarded_for_file_delivery(self):
+        pconfig = SimpleNamespace(enabled=True, extra={"app_key": "app", "app_secret": "secret", "guid": "guid"})
+        send = AsyncMock(return_value={"success": True, "message_id": "m1"})
+        message = (
+            "下载链接： "
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/2026/04/22/job-92/final.zip"
+            "?AWSAccessKeyId=test&Signature=abc"
+        )
+
+        with patch("tools.send_message_tool._send_juhe", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.JUHE,
+                    pconfig,
+                    "S:1001",
+                    message,
+                    media_files=[],
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            pconfig.extra,
+            "S:1001",
+            message,
+            media_files=[],
+        )
+
+    def test_non_juhe_certificate_render_job_links_are_not_globally_blocked(self):
+        """Certificate URL handling should stay scoped to Juhe and not break other platforms."""
+        pconfig = SimpleNamespace(enabled=True, token="discord-token", extra={})
+        send = AsyncMock(return_value={"success": True, "message_id": "d1"})
+        message = (
+            "download: "
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/2026/04/22/job-92/final.zip"
+            "?AWSAccessKeyId=test&Signature=abc"
+        )
+
+        with patch("tools.send_message_tool._send_discord", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    pconfig,
+                    "1234567890",
+                    message,
+                    media_files=[],
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with("discord-token", "1234567890", message, thread_id=None)
+
 
 class TestSendTelegramMediaDelivery:
     def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):

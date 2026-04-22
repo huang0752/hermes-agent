@@ -5,13 +5,15 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig, _apply_env_overrides
 from gateway.juhe_cache import JuheCacheStore
+from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
+from hermes_state import SessionDB
 
 
 def _make_adapter():
@@ -26,6 +28,8 @@ def _make_adapter():
                 "guid": "guid-123",
                 "private_base_url": "https://private.example/upload",
                 "allow_from": ["1001", "1002"],
+                "trigger_user_ids": ["1001", "1002"],
+                "group_sessions_per_user": False,
             },
         )
     )
@@ -191,6 +195,8 @@ class TestJuheAdapterInit:
         assert adapter._group_allow_from == ["R:2001"]
 
     def test_falls_back_to_env_vars(self, monkeypatch):
+        monkeypatch.delenv("JUHE_S3_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("JUHE_S3_SECRET_KEY", raising=False)
         monkeypatch.setenv("JUHE_APP_KEY", "env-app")
         monkeypatch.setenv("JUHE_APP_SECRET", "env-secret")
         monkeypatch.setenv("JUHE_GUID", "env-guid")
@@ -216,6 +222,12 @@ class TestJuheAdapterInit:
         assert adapter._ws_url == "wss://env.example/ws"
 
     def test_reads_inbound_s3_config_from_minio_env_aliases(self, monkeypatch):
+        monkeypatch.delenv("JUHE_INBOUND_S3_ENDPOINT_URL", raising=False)
+        monkeypatch.delenv("JUHE_INBOUND_S3_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("JUHE_INBOUND_S3_SECRET_KEY", raising=False)
+        monkeypatch.delenv("JUHE_INBOUND_S3_REGION", raising=False)
+        monkeypatch.delenv("JUHE_INBOUND_S3_BUCKET", raising=False)
+        monkeypatch.delenv("JUHE_INBOUND_S3_USE_HTTPS", raising=False)
         monkeypatch.setenv("JUHE_APP_KEY", "env-app")
         monkeypatch.setenv("JUHE_APP_SECRET", "env-secret")
         monkeypatch.setenv("JUHE_GUID", "env-guid")
@@ -235,6 +247,23 @@ class TestJuheAdapterInit:
         assert adapter._inbound_s3_region == "us-east-1"
         assert adapter._inbound_s3_bucket == "wework"
         assert adapter._inbound_s3_addressing_style == "path"
+
+    def test_reads_inbound_s3_presigned_url_expiry_from_config(self):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_url_expires_seconds": 900,
+                },
+            )
+        )
+
+        assert adapter._inbound_s3_url_expires_seconds == 900
 
     def test_resolve_inbound_s3_bucket_key_decodes_url_escaped_object_name(self):
         from gateway.platforms.juhe import JuheAdapter
@@ -257,6 +286,364 @@ class TestJuheAdapterInit:
 
         assert bucket == "wework"
         assert key == "wwcdn/2026-04-18/测试.docx"
+
+    def test_resolve_inbound_s3_bucket_key_rejects_weixin_download_url(self):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+
+        with pytest.raises(RuntimeError):
+            adapter._resolve_inbound_s3_bucket_key(
+                "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc"
+            )
+
+    def test_resolve_inbound_s3_bucket_key_rejects_minio_cgi_proxy_url(self):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+
+        with pytest.raises(RuntimeError):
+            adapter._resolve_inbound_s3_bucket_key(
+                "http://124.220.81.138:9000/cgi-bin/mmae-bin/tpdownloadmedia?param=abc"
+            )
+
+    def test_generate_inbound_presigned_url_reuses_existing_private_object(self, monkeypatch):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_bucket": "wework",
+                    "inbound_s3_url_expires_seconds": 900,
+                },
+            )
+        )
+        fake_client = MagicMock()
+        fake_client.generate_presigned_url.return_value = (
+            "https://signed.example.com/wework/wwcdn/private/report.pdf?sig=1"
+        )
+        monkeypatch.setattr(adapter, "_build_inbound_s3_client", MagicMock(return_value=fake_client))
+
+        result = adapter._generate_inbound_s3_presigned_get_url_sync(
+            "http://124.220.81.138:9000/wework/wwcdn/private/report.pdf"
+        )
+
+        assert result == "https://signed.example.com/wework/wwcdn/private/report.pdf?sig=1"
+        fake_client.generate_presigned_url.assert_called_once_with(
+            "get_object",
+            Params={"Bucket": "wework", "Key": "wwcdn/private/report.pdf"},
+            ExpiresIn=900,
+        )
+
+    @pytest.mark.asyncio
+    async def test_build_attachment_event_resolves_private_url_before_presigning_when_only_weixin_file_id_exists(
+        self, monkeypatch
+    ):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+        adapter._running = True
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="S:1001",
+            chat_type="dm",
+            user_id="1001",
+        )
+        message = SimpleNamespace(
+            text="",
+            message_id="msg-private-image-1",
+            message_type=5,
+            raw_message={
+                "msg_type": 5,
+                "file_name": "license.jpg",
+                "cdn": {
+                    "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                    "aes_key": "aes",
+                    "auth_key": "auth",
+                },
+            },
+        )
+
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_private_attachment_object_url",
+            AsyncMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/license.jpg"),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/license.jpg?X-Amz-Signature=1"),
+        )
+
+        event = await adapter._build_attachment_event(message=message, source=source)
+
+        adapter._resolve_private_attachment_object_url.assert_awaited_once()
+        adapter._generate_inbound_s3_presigned_get_url_sync.assert_called_once_with(
+            "http://124.220.81.138:9000/wework/wwcdn/private/license.jpg"
+        )
+        assert getattr(event, "_juhe_media_access_urls") == [
+            "http://124.220.81.138:9000/wework/wwcdn/private/license.jpg?X-Amz-Signature=1"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_build_attachment_event_treats_xlsx_as_url_only_and_enqueues_preheat(
+        self, monkeypatch
+    ):
+        from gateway.platforms.juhe import JuheAdapter, _ResolvedAttachmentAccessTarget
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+        adapter._running = True
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="S:1001",
+            chat_type="dm",
+            user_id="1001",
+        )
+        message = SimpleNamespace(
+            text="",
+            message_id="msg-sheet-1",
+            message_type=8,
+            raw_message={
+                "msg_type": 8,
+                "file_name": "sheet.xlsx",
+                "size": 2048,
+                "cdn": {
+                    "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=sheet",
+                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/sheet.xlsx",
+                },
+            },
+        )
+
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_inbound_attachment_access_target",
+            AsyncMock(
+                return_value=_ResolvedAttachmentAccessTarget(
+                    url="http://124.220.81.138:9000/wework/wwcdn/private/sheet.xlsx",
+                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/sheet.xlsx",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(
+                return_value="http://124.220.81.138:9000/wework/wwcdn/private/sheet.xlsx?X-Amz-Signature=1"
+            ),
+        )
+        schedule_mock = MagicMock()
+        monkeypatch.setattr(adapter, "_schedule_attachment_preheat", schedule_mock, raising=False)
+        monkeypatch.setattr(
+            "gateway.platforms.juhe.download_callback_attachment",
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called for xlsx")),
+        )
+
+        event = await adapter._build_attachment_event(message=message, source=source)
+
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/sheet.xlsx")
+        assert event.media_types == ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+        assert getattr(event, "_juhe_media_access_urls") == [
+            "http://124.220.81.138:9000/wework/wwcdn/private/sheet.xlsx?X-Amz-Signature=1"
+        ]
+        schedule_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_build_attachment_event_prefers_stable_file_identity_when_resolved_object_url_changes(
+        self, monkeypatch
+    ):
+        from gateway.platforms.juhe import JuheAdapter, _ResolvedAttachmentAccessTarget
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+        adapter._running = True
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="S:1001",
+            chat_type="dm",
+            user_id="1001",
+        )
+        message = SimpleNamespace(
+            text="",
+            message_id="msg-image-stable-id-1",
+            message_type=5,
+            raw_message={
+                "msg_type": 5,
+                "file_name": "image.jpg",
+                "cdn": {
+                    "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                    "md5": "same-md5",
+                    "size": 2048,
+                    "aes_key": "aes",
+                    "auth_key": "auth",
+                },
+            },
+        )
+
+        first_target = _ResolvedAttachmentAccessTarget(
+            url="http://124.220.81.138:9000/wework/wwcdn/2026-04-20/first_image.jpg",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/2026-04-20/first_image.jpg",
+        )
+        second_target = _ResolvedAttachmentAccessTarget(
+            url="http://124.220.81.138:9000/wework/wwcdn/2026-04-20/second_image.jpg",
+            object_url="http://124.220.81.138:9000/wework/wwcdn/2026-04-20/second_image.jpg",
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_inbound_attachment_access_target",
+            AsyncMock(side_effect=[first_target, second_target]),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(
+                side_effect=[
+                    "http://124.220.81.138:9000/wework/wwcdn/2026-04-20/first_image.jpg?X-Amz-Signature=1",
+                    "http://124.220.81.138:9000/wework/wwcdn/2026-04-20/second_image.jpg?X-Amz-Signature=1",
+                ]
+            ),
+        )
+        schedule_mock = MagicMock()
+        monkeypatch.setattr(adapter, "_schedule_attachment_preheat", schedule_mock, raising=False)
+
+        first_event = await adapter._build_attachment_event(message=message, source=source)
+        second_event = await adapter._build_attachment_event(message=message, source=source)
+
+        first_identity = getattr(first_event, "_juhe_attachment_identities")[0]
+        second_identity = getattr(second_event, "_juhe_attachment_identities")[0]
+        assert first_identity["file_id"] == second_identity["file_id"]
+        assert first_identity["file_md5"] == second_identity["file_md5"] == "same-md5"
+        assert first_identity["bucket"] == ""
+        assert first_identity["object_key"] == ""
+        assert second_identity["bucket"] == ""
+        assert second_identity["object_key"] == ""
+        assert first_event.media_urls == second_event.media_urls
+        assert schedule_mock.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_build_attachment_event_skips_preheat_for_large_supported_document(
+        self, monkeypatch
+    ):
+        from gateway.platforms.juhe import JuheAdapter, _ResolvedAttachmentAccessTarget
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="S:1001",
+            chat_type="dm",
+            user_id="1001",
+        )
+        message = SimpleNamespace(
+            text="",
+            message_id="msg-report-1",
+            message_type=8,
+            raw_message={
+                "msg_type": 8,
+                "file_name": "report.pdf",
+                "size": 5 * 1024 * 1024,
+                "cdn": {
+                    "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=report",
+                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
+                },
+            },
+        )
+
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_inbound_attachment_access_target",
+            AsyncMock(
+                return_value=_ResolvedAttachmentAccessTarget(
+                    url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
+                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(
+                return_value="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf?X-Amz-Signature=1"
+            ),
+        )
+        schedule_mock = MagicMock()
+        monkeypatch.setattr(adapter, "_schedule_attachment_preheat", schedule_mock, raising=False)
+
+        event = await adapter._build_attachment_event(message=message, source=source)
+
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls[0].endswith("/report.pdf")
+        schedule_mock.assert_called_once()
+        assert schedule_mock.call_args.kwargs["file_size"] == 5 * 1024 * 1024
 
 
 class TestJuheConnect:
@@ -354,7 +741,7 @@ class TestJuhePolicyHelpers:
         assert adapter._is_group_allowed("R:2001", "1002") is False
         assert adapter._is_group_allowed("R:2999", "1001") is False
 
-    def test_require_mention_accepts_any_at_list_entry(self):
+    def test_trigger_user_ids_and_mentions_control_group_triggering(self):
         from gateway.platforms.juhe import JuheAdapter
 
         adapter = JuheAdapter(
@@ -364,14 +751,78 @@ class TestJuhePolicyHelpers:
                     "app_key": "app",
                     "app_secret": "secret",
                     "guid": "guid",
-                    "groups": {"R:2001": {"require_mention": True}},
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
                 },
             )
         )
 
-        assert adapter._passes_mention_gate("R:2001", []) is False
-        assert adapter._passes_mention_gate("R:2001", ["someone"]) is True
-        assert adapter._passes_mention_gate("R:2002", []) is True
+        assert adapter._should_trigger_group_reply("R:2001", "1001", [], "") is False
+        assert adapter._should_trigger_group_reply("R:2001", "1001", ["bot"], "hello") is True
+        assert adapter._should_trigger_group_reply("R:2001", "1001", [], "@bot hello") is True
+        assert adapter._should_trigger_group_reply("R:2001", "1002", ["bot"], "hello") is False
+
+    def test_dm_allowlist_uses_dynamic_access_control_json_when_present(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("JUHE_ALLOWED_USERS", "S:1001")
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid",
+                    "dm_policy": "allowlist",
+                },
+            )
+        )
+
+        assert adapter._is_dm_allowed("1001") is True
+        assert adapter._is_dm_allowed("1002") is False
+
+        access_path = tmp_path / "juhe" / "access_control.json"
+        access_path.parent.mkdir(parents=True, exist_ok=True)
+        access_path.write_text(
+            json.dumps({"dm_allow_from": ["S:1002"], "group_trigger_user_ids": []}),
+            encoding="utf-8",
+        )
+
+        assert adapter._is_dm_allowed("1001") is False
+        assert adapter._is_dm_allowed("1002") is True
+
+    def test_group_trigger_users_reload_from_dynamic_access_control_json(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("JUHE_TRIGGER_USER_IDS", "S:1001")
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                },
+            )
+        )
+
+        assert adapter._should_trigger_group_reply("R:2001", "1001", ["bot"], "hello") is True
+        assert adapter._should_trigger_group_reply("R:2001", "1002", ["bot"], "hello") is False
+
+        access_path = tmp_path / "juhe" / "access_control.json"
+        access_path.parent.mkdir(parents=True, exist_ok=True)
+        access_path.write_text(
+            json.dumps({"dm_allow_from": [], "group_trigger_user_ids": ["S:1002"]}),
+            encoding="utf-8",
+        )
+
+        assert adapter._should_trigger_group_reply("R:2001", "1001", ["bot"], "hello") is False
+        assert adapter._should_trigger_group_reply("R:2001", "1002", ["bot"], "hello") is True
 
 
 class TestJuheInbound:
@@ -613,7 +1064,7 @@ class TestJuheInbound:
         assert adapter.handle_message.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_image_message_dispatches_cached_attachment_event(self, monkeypatch):
+    async def test_image_message_dispatches_url_only_attachment_event(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
         adapter = _make_adapter()
@@ -621,18 +1072,17 @@ class TestJuheInbound:
         monkeypatch.setattr(
             juhe_module,
             "download_callback_attachment",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    data=b"image-bytes",
-                    file_name="photo.jpg",
-                    content_type="image/jpeg",
-                )
-            ),
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
         )
         monkeypatch.setattr(
             juhe_module,
             "cache_image_from_bytes",
-            MagicMock(return_value="/tmp/cached-photo.jpg"),
+            MagicMock(side_effect=AssertionError("cache_image_from_bytes should not be called")),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/photo.jpg?X-Amz-Signature=1"),
         )
 
         success = await adapter._handle_callback_event(
@@ -641,7 +1091,17 @@ class TestJuheInbound:
                 "notify_type": 11010,
                 "data": {
                     "msg_type": 5,
-                    "content": '{"data":{"image":{"url":"https://example.com/a.jpg","file_name":"photo.jpg"}}}',
+                    "content": json.dumps(
+                        {
+                            "data": {
+                                "image": {
+                                    "url": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                                    "file_name": "photo.jpg",
+                                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/photo.jpg",
+                                }
+                            }
+                        }
+                    ),
                     "sender": "1001",
                     "msg_id": "msg-1",
                 },
@@ -653,11 +1113,19 @@ class TestJuheInbound:
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "[Received image: photo.jpg]"
         assert event.message_type == juhe_module.MessageType.PHOTO
-        assert event.media_urls == ["/tmp/cached-photo.jpg"]
+        assert len(event.media_urls) == 1
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/photo.jpg")
         assert event.media_types == ["image/jpeg"]
+        assert getattr(event, "_juhe_media_access_urls") == [
+            "http://124.220.81.138:9000/wework/wwcdn/private/photo.jpg?X-Amz-Signature=1"
+        ]
+        assert getattr(event, "_juhe_media_descriptions") == [
+            "图片 photo.jpg：已收到，但暂未生成描述"
+        ]
 
     @pytest.mark.asyncio
-    async def test_cdn_image_callback_dispatches_cached_attachment_event(self, monkeypatch):
+    async def test_cdn_image_callback_dispatches_url_only_attachment_event(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
         adapter = _make_adapter()
@@ -665,18 +1133,17 @@ class TestJuheInbound:
         monkeypatch.setattr(
             juhe_module,
             "download_callback_attachment",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    data=b"image-bytes",
-                    file_name="image.jpg",
-                    content_type="image/jpeg",
-                )
-            ),
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
         )
         monkeypatch.setattr(
             juhe_module,
             "cache_image_from_bytes",
-            MagicMock(return_value="/tmp/cached-image.jpg"),
+            MagicMock(side_effect=AssertionError("cache_image_from_bytes should not be called")),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/image.jpg?X-Amz-Signature=1"),
         )
 
         success = await adapter._handle_callback_event(
@@ -695,6 +1162,7 @@ class TestJuheInbound:
                         "aes_key": "aes",
                         "auth_key": "auth",
                         "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                        "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/image.jpg",
                     },
                 },
             }
@@ -705,8 +1173,181 @@ class TestJuheInbound:
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "[Received image: image.jpg]"
         assert event.message_type == juhe_module.MessageType.PHOTO
-        assert event.media_urls == ["/tmp/cached-image.jpg"]
+        assert len(event.media_urls) == 1
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/image.jpg")
         assert event.media_types == ["image/jpeg"]
+        assert getattr(event, "_juhe_media_access_urls") == [
+            "http://124.220.81.138:9000/wework/wwcdn/private/image.jpg?X-Amz-Signature=1"
+        ]
+        assert getattr(event, "_juhe_media_descriptions") == [
+            "图片 image.jpg：已收到，但暂未生成描述"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_image_attachment_normalizes_octet_stream_media_type(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "cache_image_from_bytes",
+            MagicMock(side_effect=AssertionError("cache_image_from_bytes should not be called")),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/image.jpg?X-Amz-Signature=1"),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 5,
+                    "content_type": 101,
+                    "sender": "1001",
+                    "id": "img-octet-1",
+                    "file_name": "image.jpg",
+                    "cdn": {
+                        "size": 224064,
+                        "md5": "md5",
+                        "aes_key": "aes",
+                        "auth_key": "auth",
+                        "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                        "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/image.jpg",
+                    },
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == juhe_module.MessageType.PHOTO
+        assert len(event.media_urls) == 1
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/image.jpg")
+        assert event.media_types == ["image/jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_private_image_object_reference_attaches_presigned_minio_url_without_download(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/license.jpg?X-Amz-Signature=1"),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 5,
+                    "content": json.dumps(
+                        {
+                            "data": {
+                                "image": {
+                                    "file_name": "license.jpg",
+                                    "url": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/license.jpg",
+                                }
+                            }
+                        }
+                    ),
+                    "sender": "1001",
+                    "msg_id": "msg-image-private-1",
+                },
+            }
+        )
+
+        assert success is True
+        adapter._generate_inbound_s3_presigned_get_url_sync.assert_called_once_with(
+            "http://124.220.81.138:9000/wework/wwcdn/private/license.jpg"
+        )
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert len(event.media_urls) == 1
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/license.jpg")
+        assert event.media_types == ["image/jpeg"]
+        assert getattr(event, "_juhe_media_access_urls") == [
+            "http://124.220.81.138:9000/wework/wwcdn/private/license.jpg?X-Amz-Signature=1"
+        ]
+        assert getattr(event, "_juhe_media_descriptions") == [
+            "图片 license.jpg：已收到，但暂未生成描述"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_build_attachment_event_avoids_presigning_minio_cgi_proxy_url(self, monkeypatch):
+        from gateway.platforms.juhe import JuheAdapter
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "cfg-app",
+                    "app_secret": "cfg-secret",
+                    "guid": "cfg-guid",
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+        adapter._running = True
+        source = SessionSource(
+            platform=Platform.JUHE,
+            chat_id="S:1001",
+            chat_type="dm",
+            user_id="1001",
+        )
+        message = SimpleNamespace(
+            text="",
+            message_id="msg-private-image-proxy-1",
+            message_type=5,
+            raw_message={
+                "msg_type": 5,
+                "file_name": "license.jpg",
+                "cdn": {
+                    "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                    "aes_key": "aes",
+                    "auth_key": "auth",
+                },
+            },
+        )
+
+        proxy_url = "http://124.220.81.138:9000/cgi-bin/mmae-bin/tpdownloadmedia?param=abc"
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_private_attachment_object_url",
+            AsyncMock(return_value=proxy_url),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(side_effect=AssertionError("proxy URLs must not be presigned as object keys")),
+        )
+
+        event = await adapter._build_attachment_event(message=message, source=source)
+
+        adapter._resolve_private_attachment_object_url.assert_awaited_once()
+        assert getattr(event, "_juhe_media_access_urls") == [proxy_url]
 
     @pytest.mark.asyncio
     async def test_msg_type_one_is_not_treated_as_text(self):
@@ -732,7 +1373,7 @@ class TestJuheInbound:
         adapter.send.assert_awaited_once_with("S:1001", "暂不支持撤回消息，当前仅支持文本消息。")
 
     @pytest.mark.asyncio
-    async def test_file_message_download_failure_falls_back_to_metadata_text(self, monkeypatch):
+    async def test_file_message_without_access_url_falls_back_to_metadata_text(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
         adapter = _make_adapter()
@@ -740,7 +1381,7 @@ class TestJuheInbound:
         monkeypatch.setattr(
             juhe_module,
             "download_callback_attachment",
-            AsyncMock(side_effect=RuntimeError("download failed")),
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
         )
 
         success = await adapter._handle_callback_event(
@@ -754,7 +1395,6 @@ class TestJuheInbound:
                             "data": {
                                 "file": {
                                     "file_name": "report.pdf",
-                                    "url": "https://files.example/report.pdf",
                                 }
                             }
                         }
@@ -772,6 +1412,48 @@ class TestJuheInbound:
         assert event.message_type == juhe_module.MessageType.DOCUMENT
         assert event.media_urls == []
         assert event.media_types == []
+
+    @pytest.mark.asyncio
+    async def test_download_inbound_attachment_uses_raw_cdn_fields_when_message_attrs_missing(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        mocked_download = AsyncMock(
+            return_value=SimpleNamespace(
+                data=b"spreadsheet-bytes",
+                file_name="report.xlsx",
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        )
+        monkeypatch.setattr(juhe_module, "download_callback_attachment", mocked_download)
+
+        message = SimpleNamespace(
+            raw_message={
+                "msg_type": 8,
+                "file_name": "report.xlsx",
+                "cdn": {
+                    "size": 35285,
+                    "md5": "8a88ec207c3c10a885ff755e1a91b9cf",
+                    "aes_key": "aes-key",
+                    "auth_key": "auth-key",
+                    "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                },
+            },
+            message_type=8,
+        )
+
+        result = await adapter._download_inbound_attachment(message)
+
+        assert result.file_name == "report.xlsx"
+        mocked_download.assert_awaited_once()
+        kwargs = mocked_download.await_args.kwargs
+        assert kwargs["download_url"] == "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc"
+        assert kwargs["file_id"] == "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc"
+        assert kwargs["file_name"] == "report.xlsx"
+        assert kwargs["file_size"] == 35285
+        assert kwargs["aes_key"] == "aes-key"
+        assert kwargs["auth_key"] == "auth-key"
+        assert kwargs["attachment_kind"] == "document"
 
     @pytest.mark.asyncio
     async def test_large_attachment_falls_back_to_metadata_only(self, monkeypatch):
@@ -816,37 +1498,21 @@ class TestJuheInbound:
         assert event.media_urls == []
 
     @pytest.mark.asyncio
-    async def test_private_object_access_uses_inbound_s3_fallback(self, monkeypatch):
+    async def test_private_document_object_reference_attaches_presigned_minio_url_without_download(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
         adapter = _make_adapter()
-        adapter._inbound_s3_endpoint_url = "http://124.220.81.138:9000"
-        adapter._inbound_s3_access_key = "minio-ak"
-        adapter._inbound_s3_secret_key = "minio-sk"
-        adapter._inbound_s3_bucket = "wework"
-        adapter._inbound_s3_addressing_style = "path"
         adapter.handle_message = AsyncMock()
 
         monkeypatch.setattr(
             juhe_module,
             "download_callback_attachment",
-            AsyncMock(
-                side_effect=juhe_module.QwSaasPrivateObjectAccessError(
-                    "resolved private CDN object is not publicly readable",
-                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
-                    status_code=403,
-                )
-            ),
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
         )
-        fake_body = MagicMock()
-        fake_body.read.return_value = b"%PDF-1.4\n"
-        fake_client = MagicMock()
-        fake_client.get_object.return_value = {"Body": fake_body, "ContentType": "application/pdf"}
-        monkeypatch.setattr(adapter, "_build_inbound_s3_client", MagicMock(return_value=fake_client))
         monkeypatch.setattr(
-            juhe_module,
-            "cache_document_from_bytes",
-            MagicMock(return_value="/tmp/report.pdf"),
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf?X-Amz-Signature=1"),
         )
 
         success = await adapter._handle_callback_event(
@@ -861,6 +1527,7 @@ class TestJuheInbound:
                                 "file": {
                                     "file_name": "report.pdf",
                                     "url": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
                                 }
                             }
                         }
@@ -872,16 +1539,23 @@ class TestJuheInbound:
         )
 
         assert success is True
-        fake_client.get_object.assert_called_once_with(Bucket="wework", Key="wwcdn/private/report.pdf")
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "[Received document: report.pdf]"
         assert event.message_type == juhe_module.MessageType.DOCUMENT
-        assert event.media_urls == ["/tmp/report.pdf"]
+        assert len(event.media_urls) == 1
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/report.pdf")
         assert event.media_types == ["application/pdf"]
+        assert getattr(event, "_juhe_media_access_urls") == [
+            "http://124.220.81.138:9000/wework/wwcdn/private/report.pdf?X-Amz-Signature=1"
+        ]
+        assert getattr(event, "_juhe_media_descriptions") == [
+            "文件 report.pdf：已收到，待解析"
+        ]
 
     @pytest.mark.asyncio
-    async def test_private_object_access_without_inbound_s3_config_falls_back_to_metadata(self, monkeypatch):
+    async def test_private_document_object_reference_without_presign_falls_back_to_metadata(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
         adapter = _make_adapter()
@@ -889,13 +1563,12 @@ class TestJuheInbound:
         monkeypatch.setattr(
             juhe_module,
             "download_callback_attachment",
-            AsyncMock(
-                side_effect=juhe_module.QwSaasPrivateObjectAccessError(
-                    "resolved private CDN object is not publicly readable",
-                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
-                    status_code=403,
-                )
-            ),
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(side_effect=RuntimeError("presign failed")),
         )
 
         success = await adapter._handle_callback_event(
@@ -910,6 +1583,7 @@ class TestJuheInbound:
                                 "file": {
                                     "file_name": "report.pdf",
                                     "url": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=abc",
+                                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
                                 }
                             }
                         }
@@ -928,7 +1602,7 @@ class TestJuheInbound:
         assert event.media_urls == []
 
     @pytest.mark.asyncio
-    async def test_message_with_text_and_document_preserves_text(self, monkeypatch):
+    async def test_message_with_text_and_document_preserves_text_without_local_cache(self, monkeypatch):
         import gateway.platforms.juhe as juhe_module
 
         adapter = _make_adapter()
@@ -936,18 +1610,12 @@ class TestJuheInbound:
         monkeypatch.setattr(
             juhe_module,
             "download_callback_attachment",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    data=b"%PDF-1.4\n",
-                    file_name="report.pdf",
-                    content_type="application/pdf",
-                )
-            ),
+            AsyncMock(side_effect=AssertionError("download_callback_attachment should not be called")),
         )
         monkeypatch.setattr(
-            juhe_module,
-            "cache_document_from_bytes",
-            MagicMock(return_value="/tmp/report.pdf"),
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(return_value="http://124.220.81.138:9000/wework/wwcdn/private/report.pdf?X-Amz-Signature=1"),
         )
 
         success = await adapter._handle_callback_event(
@@ -962,7 +1630,7 @@ class TestJuheInbound:
                             "data": {
                                 "file": {
                                     "file_name": "report.pdf",
-                                    "url": "https://files.example/report.pdf",
+                                    "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/report.pdf",
                                 }
                             },
                         }
@@ -978,7 +1646,9 @@ class TestJuheInbound:
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "please review"
         assert event.message_type == juhe_module.MessageType.DOCUMENT
-        assert event.media_urls == ["/tmp/report.pdf"]
+        assert len(event.media_urls) == 1
+        assert event.media_urls[0].startswith("juhe://attachment/")
+        assert event.media_urls[0].endswith("/report.pdf")
         assert event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
@@ -1002,9 +1672,10 @@ class TestJuheInbound:
         assert adapter.handle_message.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_group_require_mention_blocks_when_no_at_list(self):
+    async def test_non_trigger_group_message_is_buffered_without_dispatch(self, tmp_path, monkeypatch):
         from gateway.platforms.juhe import JuheAdapter
 
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         adapter = JuheAdapter(
             PlatformConfig(
                 enabled=True,
@@ -1014,7 +1685,7 @@ class TestJuheInbound:
                     "guid": "guid-123",
                     "group_policy": "allowlist",
                     "group_allow_from": ["R:2001"],
-                    "groups": {"R:2001": {"require_mention": True}},
+                    "trigger_user_ids": ["1001"],
                 },
             )
         )
@@ -1026,22 +1697,128 @@ class TestJuheInbound:
                 "notify_type": 11010,
                 "data": {
                     "msg_type": 2,
-                    "content": '{"msg":"hello group"}',
-                    "sender": "1001",
-                    "chat_id": "2001",
-                    "is_group": True,
-                    "msg_id": "msg-1",
-                    "at_list": [],
+                    "content": '{"msg":"hello group backlog"}',
+                    "sender": "1002",
+                    "roomid": "2001",
+                    "id": "juhe-id-buffer-1",
+                    "at_list": ["bot"],
                 },
             }
         )
 
         assert success is True
         adapter.handle_message.assert_not_awaited()
+        room_log = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            history = room_log.get_room_history("juhe", "R:2001", limit=10)
+        finally:
+            room_log.close()
+        assert [item["message_id"] for item in history] == ["juhe-id-buffer-1"]
+        assert history[0]["triggered"] is False
+        assert history[0]["consumed_for_context"] is False
 
     @pytest.mark.asyncio
-    async def test_msg_type_two_plain_text_group_message_dispatches(self):
+    async def test_non_trigger_group_attachment_schedules_background_preheat(self, tmp_path, monkeypatch):
+        from gateway.platforms.juhe import JuheAdapter, _ResolvedAttachmentAccessTarget
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid-123",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
+                    "inbound_s3_endpoint_url": "http://124.220.81.138:9000",
+                    "inbound_s3_bucket": "wework",
+                },
+            )
+        )
+        adapter.handle_message = AsyncMock()
+        schedule_mock = MagicMock()
+        monkeypatch.setattr(adapter, "_schedule_attachment_preheat", schedule_mock, raising=False)
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_inbound_attachment_access_target",
+            AsyncMock(
+                return_value=_ResolvedAttachmentAccessTarget(
+                    url="http://124.220.81.138:9000/wework/wwcdn/private/group-sheet.xlsx",
+                    object_url="http://124.220.81.138:9000/wework/wwcdn/private/group-sheet.xlsx",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_generate_inbound_s3_presigned_get_url_sync",
+            MagicMock(
+                return_value=(
+                    "http://124.220.81.138:9000/wework/wwcdn/private/group-sheet.xlsx"
+                    "?X-Amz-Signature=1"
+                )
+            ),
+        )
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content_type": 102,
+                    "sender": "1002",
+                    "roomid": "2001",
+                    "id": "juhe-id-buffer-file-1",
+                    "file_name": "group-sheet.xlsx",
+                    "cdn": {
+                        "size": 20139,
+                        "md5": "2755fb84185cee98987b35bb9f4481b8",
+                        "aes_key": "aes-key",
+                        "auth_key": "auth-key",
+                        "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=group-file",
+                        "object_url": "http://124.220.81.138:9000/wework/wwcdn/private/group-sheet.xlsx",
+                    },
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_not_awaited()
+        schedule_mock.assert_called_once()
+        room_log = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            history = room_log.get_room_history("juhe", "R:2001", limit=10)
+        finally:
+            room_log.close()
+        assert [item["message_id"] for item in history] == ["juhe-id-buffer-file-1"]
+        assert history[0]["triggered"] is False
+        assert history[0]["consumed_for_context"] is False
+
+    @pytest.mark.asyncio
+    async def test_trigger_group_message_rehydrates_buffered_document_attachment(self, tmp_path, monkeypatch):
         from gateway.platforms.juhe import JuheAdapter
+
+        import gateway.platforms.juhe as juhe_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            juhe_module,
+            "download_callback_attachment",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    data=b"sheet-bytes",
+                    file_name="group-sheet.xlsx",
+                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            juhe_module,
+            "cache_document_from_bytes",
+            MagicMock(return_value="/tmp/group-sheet.xlsx"),
+        )
 
         adapter = JuheAdapter(
             PlatformConfig(
@@ -1052,7 +1829,147 @@ class TestJuheInbound:
                     "guid": "guid-123",
                     "group_policy": "allowlist",
                     "group_allow_from": ["R:2001"],
-                    "groups": {"R:2001": {"require_mention": True}},
+                    "trigger_user_ids": ["1001"],
+                },
+            )
+        )
+        adapter.handle_message = AsyncMock()
+
+        buffered = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 8,
+                    "content_type": 102,
+                    "sender": "1002",
+                    "roomid": "2001",
+                    "id": "juhe-id-group-file-1",
+                    "file_name": "group-sheet.xlsx",
+                    "cdn": {
+                        "size": 20139,
+                        "md5": "2755fb84185cee98987b35bb9f4481b8",
+                        "aes_key": "aes-key",
+                        "auth_key": "auth-key",
+                        "file_id": "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=group-file",
+                    },
+                },
+            }
+        )
+
+        assert buffered is True
+        adapter.handle_message.assert_not_awaited()
+
+        triggered = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content_type": 2,
+                    "content": "@bot 我发的文件你读取得到吗",
+                    "sender": "1001",
+                    "roomid": "2001",
+                    "id": "juhe-id-group-file-2",
+                    "at_list": ["bot"],
+                },
+            }
+        )
+
+        assert triggered is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "@bot 我发的文件你读取得到吗"
+        assert event.media_urls == ["/tmp/group-sheet.xlsx"]
+        assert (
+            event.media_types
+            == ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+        )
+        assert "[文件] group-sheet.xlsx" in getattr(event, "_juhe_pending_context_text", "")
+
+    @pytest.mark.asyncio
+    async def test_trigger_group_message_with_structured_mention_reuses_persistent_room_context(self, tmp_path, monkeypatch):
+        from gateway.platforms.juhe import JuheAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        first = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid-123",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
+                    "group_sessions_per_user": False,
+                },
+            )
+        )
+        first.handle_message = AsyncMock()
+
+        buffered = await first._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content": "Earlier customer context",
+                    "sender": "1002",
+                    "roomid": "2001",
+                    "id": "juhe-id-room-1",
+                },
+            }
+        )
+        assert buffered is True
+        first.handle_message.assert_not_awaited()
+
+        not_triggered = await first._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content_type": 2,
+                    "content": "ping juhe without mention",
+                    "sender": "1001",
+                    "roomid": "2001",
+                    "id": "juhe-id-room-2",
+                    "at_list": [],
+                },
+            }
+        )
+
+        assert not_triggered is True
+        first.handle_message.assert_not_awaited()
+
+        room_log = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            history = room_log.get_room_history("juhe", "R:2001", limit=10)
+        finally:
+            room_log.close()
+
+        assert [item["message_id"] for item in history] == ["juhe-id-room-1", "juhe-id-room-2"]
+        assert history[0]["consumed_for_context"] is False
+        assert history[1]["triggered"] is False
+        assert history[1]["consumed_for_context"] is False
+
+    @pytest.mark.asyncio
+    async def test_trigger_group_message_allows_textual_mention_fallback_when_at_list_missing(self, tmp_path, monkeypatch):
+        from gateway.platforms.juhe import JuheAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid-123",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
+                    "group_sessions_per_user": False,
                 },
             )
         )
@@ -1065,10 +1982,114 @@ class TestJuheInbound:
                 "data": {
                     "msg_type": 2,
                     "content_type": 2,
-                    "content": "@bot ping juhe",
+                    "content": "@bot ping juhe with textual mention fallback",
                     "sender": "1001",
                     "roomid": "2001",
-                    "id": "juhe-id-1",
+                    "id": "juhe-id-room-textual-mention-1",
+                    "at_list": [],
+                },
+            }
+        )
+
+        assert success is True
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "@bot ping juhe with textual mention fallback"
+
+    @pytest.mark.asyncio
+    async def test_trigger_group_message_requires_mention_and_reuses_persistent_room_context(self, tmp_path, monkeypatch):
+        from gateway.platforms.juhe import JuheAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        first = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid-123",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
+                    "group_sessions_per_user": False,
+                },
+            )
+        )
+        first.handle_message = AsyncMock()
+
+        buffered = await first._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content": "Earlier customer context",
+                    "sender": "1002",
+                    "roomid": "2001",
+                    "id": "juhe-id-room-1",
+                },
+            }
+        )
+        assert buffered is True
+        first.handle_message.assert_not_awaited()
+
+        not_triggered = await first._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content_type": 2,
+                    "content": "ping juhe without mention",
+                    "sender": "1001",
+                    "roomid": "2001",
+                    "id": "juhe-id-room-2",
+                    "at_list": [],
+                },
+            }
+        )
+
+        assert not_triggered is True
+        first.handle_message.assert_not_awaited()
+
+        room_log = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            history = room_log.get_room_history("juhe", "R:2001", limit=10)
+        finally:
+            room_log.close()
+
+        assert [item["message_id"] for item in history] == ["juhe-id-room-1", "juhe-id-room-2"]
+        assert history[0]["consumed_for_context"] is False
+        assert history[1]["triggered"] is False
+        assert history[1]["consumed_for_context"] is False
+
+        adapter = JuheAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "app_key": "app",
+                    "app_secret": "secret",
+                    "guid": "guid-123",
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["R:2001"],
+                    "trigger_user_ids": ["1001"],
+                    "group_sessions_per_user": False,
+                },
+            )
+        )
+        adapter.handle_message = AsyncMock()
+
+        success = await adapter._handle_callback_event(
+            {
+                "guid": "guid-123",
+                "notify_type": 11010,
+                "data": {
+                    "msg_type": 2,
+                    "content_type": 2,
+                    "content": "ping juhe with mention",
+                    "sender": "1001",
+                    "roomid": "2001",
+                    "id": "juhe-id-room-3",
                     "at_list": ["bot"],
                 },
             }
@@ -1077,9 +2098,25 @@ class TestJuheInbound:
         assert success is True
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
-        assert event.text == "@bot ping juhe"
+        assert event.text == "ping juhe with mention"
         assert event.source.chat_id == "R:2001"
         assert event.source.chat_type == "group"
+        assert getattr(event.source, "shared_session", False) is True
+        assert "Earlier customer context" in getattr(event, "_juhe_pending_context_text", "")
+        assert "ping juhe without mention" in getattr(event, "_juhe_pending_context_text", "")
+
+        room_log = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            history = room_log.get_room_history("juhe", "R:2001", limit=10)
+        finally:
+            room_log.close()
+
+        assert [item["message_id"] for item in history] == ["juhe-id-room-1", "juhe-id-room-2", "juhe-id-room-3"]
+        assert history[0]["consumed_for_context"] is True
+        assert history[1]["triggered"] is False
+        assert history[1]["consumed_for_context"] is True
+        assert history[2]["triggered"] is True
+        assert history[2]["consumed_for_context"] is True
 
     @pytest.mark.asyncio
     async def test_roomid_zero_is_treated_as_dm(self):
@@ -1184,6 +2221,87 @@ class TestJuheInbound:
 
 
 class TestJuheSend:
+    def test_format_message_strips_visible_markdown(self):
+        adapter = _make_adapter()
+
+        formatted = adapter.format_message(
+            "这个是**优化md**\n\n1. **购买项目**：`云服务费`\n2. [查看详情](https://example.com)"
+        )
+
+        assert formatted == (
+            "这个是优化md\n\n1. 购买项目：云服务费\n2. 查看详情"
+        )
+
+    def test_format_message_preserves_media_directives(self):
+        adapter = _make_adapter()
+
+        formatted = adapter.format_message(
+            "先看**说明**\nMEDIA:/tmp/test invoice.pdf\n再看[链接](https://example.com)"
+        )
+
+        assert formatted == (
+            "先看说明\nMEDIA:/tmp/test invoice.pdf\n再看链接"
+        )
+
+    def test_format_message_strips_certificate_skill_instruction_leakage(self):
+        adapter = _make_adapter()
+
+        formatted = adapter.format_message(
+            "确认后我直接出执行草案。\n"
+            " artifact, or equivalent non-link deliverable.\\n"
+            "- If any business meaning is uncertain, stop and ask directly. "
+            "Do not guess templates, certificate names, professional terms, "
+            "logo choices, or multi-date meanings.\\n\\nPrefer"
+        )
+
+        assert formatted == "确认后我直接出执行草案。"
+
+    def test_format_message_strips_local_delivery_path_from_visible_text(self):
+        adapter = _make_adapter()
+
+        formatted = adapter.format_message(
+            "压缩包已生成。\n本地路径：/tmp/certificate-delivery/final.zip\n请查收。"
+        )
+
+        assert "压缩包已生成。" in formatted
+        assert "请查收。" in formatted
+        assert "/tmp/certificate-delivery/final.zip" not in formatted
+        assert "本地路径" not in formatted
+
+    @pytest.mark.asyncio
+    async def test_on_processing_complete_sanitizes_room_memory_assistant_response(self, monkeypatch):
+        from gateway.platforms.juhe import ProcessingOutcome
+
+        adapter = _make_adapter()
+        captured = {}
+
+        def _fake_schedule_room_memory_update(_room_id, **kwargs):
+            captured["room_id"] = _room_id
+            captured.update(kwargs)
+
+        monkeypatch.setattr(
+            "gateway.platforms.juhe.schedule_room_memory_update",
+            _fake_schedule_room_memory_update,
+        )
+
+        event = SimpleNamespace(
+            source=SimpleNamespace(chat_type="group", chat_id="R:2001"),
+            text="@魔法老头 出证书",
+            _final_response_text=(
+                "确认后我直接出执行草案。\n"
+                " artifact, or equivalent non-link deliverable.\\n"
+                "- If any business meaning is uncertain, stop and ask directly. "
+                "Do not guess templates, certificate names, professional terms, "
+                "logo choices, or multi-date meanings.\\n\\nPrefer"
+            ),
+            _juhe_pending_context_text="",
+            _juhe_relevant_room_history_text="",
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert captured["assistant_response"] == "确认后我直接出执行草案。"
+
     @pytest.mark.asyncio
     async def test_send_text_uses_guid_request_and_requires_prefixed_target(self):
         adapter = _make_adapter()
@@ -1198,6 +2316,22 @@ class TestJuheSend:
         assert payload["data"]["guid"] == "guid-123"
         assert payload["data"]["conversation_id"] == "S:1001"
         assert payload["data"]["content"] == "hello juhe"
+
+    @pytest.mark.asyncio
+    async def test_send_text_formats_plain_text_for_juhe(self):
+        adapter = _make_adapter()
+        adapter._guid_request = AsyncMock(return_value={"err_code": 0, "data": {"ret": 0}})
+
+        result = await adapter.send(
+            "S:1001",
+            "这个是**优化md**这张电子发票是**腾讯云**开具给[广东第二师范学院](https://example.com)的。",
+        )
+
+        assert result.success is True
+        payload = adapter._guid_request.await_args.kwargs
+        assert payload["data"]["content"] == (
+            "这个是优化md这张电子发票是腾讯云开具给广东第二师范学院的。"
+        )
 
     @pytest.mark.asyncio
     async def test_send_rejects_unprefixed_target(self):
@@ -1261,28 +2395,136 @@ class TestJuheSend:
         assert size_hint == 33123874
 
     @pytest.mark.asyncio
-    async def test_send_document_uses_small_file_flow_for_http_url(self, monkeypatch):
-        import gateway.platforms.juhe as juhe_module
-
+    async def test_send_document_materializes_http_url_before_upload(self, monkeypatch):
         adapter = _make_adapter()
-        small_upload = AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-file-1"}})
-        big_upload = AsyncMock(return_value={"error_code": 0})
-        monkeypatch.setattr(juhe_module, "send_small_file_from_url", small_upload)
-        monkeypatch.setattr(juhe_module, "send_big_file_from_url", big_upload)
-        monkeypatch.setattr(adapter, "_get_remote_file_size_hint", AsyncMock(return_value=1024))
+        cleanup = AsyncMock()
+        monkeypatch.setattr(
+            adapter,
+            "_materialize_remote_document_for_upload",
+            AsyncMock(return_value=("/tmp/materialized-report.pdf", cleanup)),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_stage_local_file_for_upload",
+            AsyncMock(return_value=("https://temp.example.com/report.pdf?sig=1", AsyncMock())),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_upload_file_from_url",
+            AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-file-1"}}),
+        )
 
         result = await adapter.send_document("S:1001", "https://files.example.com/report.pdf")
 
         assert result.success is True
         assert result.message_id == "msg-file-1"
-        small_upload.assert_awaited_once_with(
-            client=adapter._get_sdk_client(),
-            conversation_id="S:1001",
-            file_url="https://files.example.com/report.pdf",
-            file_name="report.pdf",
-            file_type=5,
+        adapter._materialize_remote_document_for_upload.assert_awaited_once_with(
+            "https://files.example.com/report.pdf",
+            "report.pdf",
         )
-        big_upload.assert_not_awaited()
+        adapter._stage_local_file_for_upload.assert_awaited_once_with("/tmp/materialized-report.pdf")
+        cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_document_materializes_signed_http_url_before_upload(self, monkeypatch):
+        adapter = _make_adapter()
+        cleanup = AsyncMock()
+        monkeypatch.setattr(
+            adapter,
+            "_materialize_remote_document_for_upload",
+            AsyncMock(return_value=("/tmp/materialized-final.zip", cleanup)),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_stage_local_file_for_upload",
+            AsyncMock(return_value=("https://temp.example.com/final.zip?sig=1", AsyncMock())),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_upload_file_from_url",
+            AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-signed-1"}}),
+        )
+
+        result = await adapter.send_document(
+            "S:1001",
+            "https://minio.example.com/exports/final.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=secret",
+        )
+
+        assert result.success is True
+        assert result.message_id == "msg-signed-1"
+        adapter._materialize_remote_document_for_upload.assert_awaited_once_with(
+            "https://minio.example.com/exports/final.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=secret",
+            "final.zip",
+        )
+        adapter._stage_local_file_for_upload.assert_awaited_once_with("/tmp/materialized-final.zip")
+        cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_document_materializes_remote_document_before_upload(self, monkeypatch):
+        adapter = _make_adapter()
+        cleanup = AsyncMock()
+        monkeypatch.setattr(
+            adapter,
+            "_materialize_remote_document_for_upload",
+            AsyncMock(return_value=("/tmp/materialized-report.pdf", cleanup)),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_stage_local_file_for_upload",
+            AsyncMock(return_value=("https://temp.example.com/report.pdf?sig=1", AsyncMock())),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_upload_file_from_url",
+            AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-materialized-1"}}),
+        )
+
+        result = await adapter.send_document("S:1001", "https://files.example.com/report.pdf")
+
+        assert result.success is True
+        adapter._materialize_remote_document_for_upload.assert_awaited_once_with(
+            "https://files.example.com/report.pdf",
+            "report.pdf",
+        )
+        adapter._stage_local_file_for_upload.assert_awaited_once_with("/tmp/materialized-report.pdf")
+        cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_document_materializes_certificate_render_job_remote_url(self, monkeypatch):
+        adapter = _make_adapter()
+        materialized_cleanup = AsyncMock()
+        staged_cleanup = AsyncMock()
+        monkeypatch.setattr(
+            adapter,
+            "_materialize_remote_document_for_upload",
+            AsyncMock(return_value=("/tmp/materialized-certificate.zip", materialized_cleanup)),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_stage_local_file_for_upload",
+            AsyncMock(return_value=("https://temp.example.com/materialized-certificate.zip?sig=1", staged_cleanup)),
+        )
+        monkeypatch.setattr(
+            adapter,
+            "_upload_file_from_url",
+            AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-cert-url-1"}}),
+        )
+
+        result = await adapter.send_document(
+            "S:1001",
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/2026/04/22/job-92/final.zip"
+            "?AWSAccessKeyId=test&Signature=abc&Expires=123",
+        )
+
+        assert result.success is True
+        adapter._materialize_remote_document_for_upload.assert_awaited_once_with(
+            "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/2026/04/22/job-92/final.zip"
+            "?AWSAccessKeyId=test&Signature=abc&Expires=123",
+            "final.zip",
+        )
+        adapter._stage_local_file_for_upload.assert_awaited_once_with("/tmp/materialized-certificate.zip")
+        materialized_cleanup.assert_awaited_once()
+        staged_cleanup.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_send_image_uses_big_file_flow_when_remote_size_is_large(self, monkeypatch):
@@ -1338,6 +2580,29 @@ class TestJuheSend:
             file_type=5,
         )
         cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_upload_file_from_url_retries_big_upload_after_small_timeout(self, monkeypatch):
+        import gateway.platforms.juhe as juhe_module
+
+        adapter = _make_adapter()
+        small_upload = AsyncMock(side_effect=RuntimeError("HTTP error: (ReadTimeout)"))
+        big_upload = AsyncMock(return_value={"error_code": 0, "data": {"message_id": "msg-big-fallback"}})
+        monkeypatch.setattr(juhe_module, "send_small_file_from_url", small_upload)
+        monkeypatch.setattr(juhe_module, "send_big_file_from_url", big_upload)
+        monkeypatch.setattr(adapter, "_get_remote_file_size_hint", AsyncMock(return_value=1024))
+
+        result = await adapter._upload_file_from_url(
+            client=adapter._get_sdk_client(),
+            conversation_id="S:1001",
+            file_url="https://temp.example.com/report.zip?sig=1",
+            file_name="report.zip",
+            file_type=5,
+        )
+
+        assert result["data"]["message_id"] == "msg-big-fallback"
+        small_upload.assert_awaited_once()
+        big_upload.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_send_document_rejects_local_path_without_temp_s3(self, tmp_path):
@@ -1410,6 +2675,9 @@ class TestGatewayIntegration:
 
         assert "juhe" in PLATFORM_HINTS
         assert "juhe" in PLATFORM_HINTS["juhe"].lower()
+        assert "MEDIA:https://..." not in PLATFORM_HINTS["juhe"]
+        assert "certificate_workflow_tool" in PLATFORM_HINTS["juhe"]
+        assert "MEDIA:/absolute/path" in PLATFORM_HINTS["juhe"]
 
 
 class TestSendJuheStandalone:
@@ -1466,6 +2734,122 @@ class TestSendJuheStandalone:
         }
         adapter.send.assert_awaited_once_with("S:1001", "hello juhe")
         adapter.send_document.assert_awaited_once_with("S:1001", "https://files.example.com/report.pdf")
+
+    @pytest.mark.asyncio
+    async def test_send_juhe_sends_document_before_text_for_document_media(self):
+        from tools.send_message_tool import _send_juhe
+
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=True)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-123", error=None))
+        adapter.send_document = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="file-456", error=None)
+        )
+        adapter.disconnect = AsyncMock()
+
+        with patch("gateway.platforms.juhe.check_juhe_requirements", return_value=True), \
+             patch("tools.send_message_tool.JuheAdapter", return_value=adapter):
+            result = await _send_juhe(
+                {"app_key": "app", "app_secret": "secret", "guid": "guid"},
+                "S:1001",
+                "证书压缩包已就绪：\nreport.zip",
+                media_files=[("https://files.example.com/report.zip", False)],
+            )
+
+        assert result == {
+            "success": True,
+            "platform": "juhe",
+            "chat_id": "S:1001",
+            "message_id": "file-456",
+        }
+        assert adapter.mock_calls.index(call.send_document("S:1001", "https://files.example.com/report.zip")) < (
+            adapter.mock_calls.index(call.send("S:1001", "证书压缩包已就绪：\nreport.zip"))
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_juhe_suppresses_success_text_when_document_delivery_fails(self):
+        from tools.send_message_tool import _send_juhe
+
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=True)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-123", error=None))
+        adapter.send_document = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id="", error="ReadTimeout")
+        )
+        adapter.disconnect = AsyncMock()
+
+        with patch("gateway.platforms.juhe.check_juhe_requirements", return_value=True), \
+             patch("tools.send_message_tool.JuheAdapter", return_value=adapter):
+            result = await _send_juhe(
+                {"app_key": "app", "app_secret": "secret", "guid": "guid"},
+                "S:1001",
+                "证书压缩包已就绪：\nreport.zip",
+                media_files=[("https://files.example.com/report.zip", False)],
+            )
+
+        assert "error" in result
+        assert "ReadTimeout" in result["error"]
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_juhe_forwards_certificate_render_job_remote_media(self):
+        from tools.send_message_tool import _send_juhe
+
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=True)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-123", error=None))
+        adapter.send_document = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="file-456", error=None)
+        )
+        adapter.disconnect = AsyncMock()
+
+        with patch("gateway.platforms.juhe.check_juhe_requirements", return_value=True), \
+             patch("tools.send_message_tool.JuheAdapter", return_value=adapter):
+            result = await _send_juhe(
+                {"app_key": "app", "app_secret": "secret", "guid": "guid"},
+                "S:1001",
+                "",
+                media_files=[
+                    (
+                        "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/2026/04/22/job-92/final.zip"
+                        "?AWSAccessKeyId=test&Signature=abc&Expires=123",
+                        False,
+                    )
+                ],
+            )
+
+        assert result["success"] is True
+        adapter.send_document.assert_awaited_once()
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_juhe_sanitizes_certificate_render_job_url_in_text_instead_of_blocking(self):
+        from tools.send_message_tool import _send_juhe
+
+        adapter = MagicMock()
+        adapter.connect = AsyncMock(return_value=True)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-222", error=None))
+        adapter.disconnect = AsyncMock()
+
+        with patch("gateway.platforms.juhe.check_juhe_requirements", return_value=True), \
+             patch("tools.send_message_tool.JuheAdapter", return_value=adapter):
+            result = await _send_juhe(
+                {"app_key": "app", "app_secret": "secret", "guid": "guid"},
+                "S:1001",
+                (
+                    "压缩包已生成。\n"
+                    "下载链接："
+                    "http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+                    "2026/04/22/job-92/final.zip?AWSAccessKeyId=test&Signature=abc&Expires=123"
+                ),
+                media_files=[],
+            )
+
+        assert result["success"] is True
+        adapter.send.assert_awaited_once()
+        sent_text = adapter.send.await_args.args[1]
+        assert "certificate_render_jobs" not in sent_text
+        assert "下载链接" not in sent_text
 
     @pytest.mark.asyncio
     async def test_send_juhe_expands_local_media_home_path(self, monkeypatch, tmp_path):

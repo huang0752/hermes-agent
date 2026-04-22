@@ -15,6 +15,11 @@ import time
 from urllib.parse import urlparse
 
 from agent.redact import redact_sensitive_text
+from gateway.delivery_rules import (
+    JUHE_CERTIFICATE_REMOTE_DELIVERY_ERROR,
+    contains_certificate_render_job_url,
+    is_certificate_render_job_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +73,15 @@ def _media_source_extension(value: str) -> str:
     if _looks_like_http_url(text):
         text = urlparse(text).path
     return os.path.splitext(text)[1].lower()
+
+
+def _is_document_media_source(value: str) -> bool:
+    ext = _media_source_extension(value)
+    return bool(ext) and ext not in _IMAGE_EXTS and ext not in _VIDEO_EXTS and ext not in _AUDIO_EXTS
+
+
+def _juhe_certificate_delivery_error() -> dict:
+    return _error(JUHE_CERTIFICATE_REMOTE_DELIVERY_ERROR)
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -413,6 +427,47 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # --- Juhe: native URL-backed media delivery via the adapter helper ---
     if platform == Platform.JUHE:
+        if contains_certificate_render_job_url(message):
+            return _juhe_certificate_delivery_error()
+
+        document_media = [entry for entry in media_files if _is_document_media_source(entry[0])]
+        trailing_media = [entry for entry in media_files if not _is_document_media_source(entry[0])]
+
+        if document_media:
+            last_result = await _send_juhe(
+                pconfig.extra,
+                chat_id,
+                "",
+                media_files=document_media,
+            )
+            if isinstance(last_result, dict) and last_result.get("error"):
+                return last_result
+
+            for chunk in chunks:
+                if not chunk.strip():
+                    continue
+                result = await _send_juhe(
+                    pconfig.extra,
+                    chat_id,
+                    chunk,
+                    media_files=[],
+                )
+                if isinstance(result, dict) and result.get("error"):
+                    return result
+                last_result = result
+
+            if trailing_media:
+                result = await _send_juhe(
+                    pconfig.extra,
+                    chat_id,
+                    "",
+                    media_files=trailing_media,
+                )
+                if isinstance(result, dict) and result.get("error"):
+                    return result
+                last_result = result
+            return last_result
+
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
@@ -1010,6 +1065,9 @@ async def _send_juhe(extra, chat_id, message, media_files=None):
 
     media_files = media_files or []
 
+    if contains_certificate_render_job_url(message):
+        return _juhe_certificate_delivery_error()
+
     try:
         from gateway.config import PlatformConfig
 
@@ -1020,12 +1078,39 @@ async def _send_juhe(extra, chat_id, message, media_files=None):
             return _error(f"Juhe: failed to connect - {adapter.fatal_error_message or 'unknown error'}")
         try:
             last_result = None
+            last_media_result = None
+            last_text_result = None
+
+            document_media = []
+            trailing_media = []
+            for media_entry in media_files:
+                media_path, is_voice = media_entry
+                if _is_document_media_source(media_path):
+                    document_media.append(media_entry)
+                else:
+                    trailing_media.append(media_entry)
+
+            for media_path, _is_voice in document_media:
+                if is_certificate_render_job_url(media_path):
+                    return _juhe_certificate_delivery_error()
+                normalized_media_path = media_path
+                if not _looks_like_http_url(media_path):
+                    normalized_media_path = os.path.expanduser(media_path)
+                    if not os.path.exists(normalized_media_path):
+                        return _error(f"Media file not found: {media_path}")
+
+                last_result = await adapter.send_document(chat_id, normalized_media_path)
+                if not last_result.success:
+                    return _error(f"Juhe media send failed: {last_result.error}")
+                last_media_result = last_result
+
             if message.strip():
                 last_result = await adapter.send(chat_id, message)
                 if not last_result.success:
                     return _error(f"Juhe send failed: {last_result.error}")
+                last_text_result = last_result
 
-            for media_path, is_voice in media_files:
+            for media_path, is_voice in trailing_media:
                 normalized_media_path = media_path
                 if not _looks_like_http_url(media_path):
                     normalized_media_path = os.path.expanduser(media_path)
@@ -1046,15 +1131,17 @@ async def _send_juhe(extra, chat_id, message, media_files=None):
 
                 if not last_result.success:
                     return _error(f"Juhe media send failed: {last_result.error}")
+                last_media_result = last_result
 
             if last_result is None:
                 return {"error": "No deliverable text or media remained after processing MEDIA tags"}
 
+            result_message = last_media_result or last_text_result or last_result
             return {
                 "success": True,
                 "platform": "juhe",
                 "chat_id": chat_id,
-                "message_id": last_result.message_id,
+                "message_id": result_message.message_id,
             }
         finally:
             await adapter.disconnect()

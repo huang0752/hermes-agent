@@ -1,0 +1,21 @@
+[
+  {
+    "room_id": "2001",
+    "roomname": "Dev Group",
+    "member_count": 3,
+    "members": [
+      { "uin": "1001", "nickname": "Alice" },
+      { "uin": "1002", "nickname": "Bob" },
+      { "uin": "1003", "nickname": "Carol" }
+    ]
+  },
+  {
+    "room_id": "2002",
+    "roomname": "Ops Group",
+    "member_count": 2,
+    "members": [
+      { "uin": "2001", "nickname": "Dora" },
+      { "uin": "2002", "nickname": "Evan" }
+    ]
+  }
+]

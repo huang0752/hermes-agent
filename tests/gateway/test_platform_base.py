@@ -8,6 +8,7 @@ from gateway.platforms.base import (
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
+    media_reference_suffix,
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
@@ -44,6 +45,15 @@ class TestSafeUrlForLog:
         assert safe_url_for_log(url, max_len=3) == "..."
         assert safe_url_for_log(url, max_len=2) == ".."
         assert safe_url_for_log(url, max_len=0) == ""
+
+
+class TestMediaReferenceSuffix:
+    def test_strips_query_string_from_remote_url(self):
+        value = "https://files.example.com/final/report.zip?AWSAccessKeyId=ak&Signature=secret"
+        assert media_reference_suffix(value) == ".zip"
+
+    def test_handles_local_paths(self):
+        assert media_reference_suffix("/tmp/example/image.png") == ".png"
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +336,35 @@ class TestExtractMedia:
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [("/Users/chou/Desktop/藤毅专利/模板 (空白).docx", False)]
         assert cleaned == ""
+
+    def test_media_tag_supports_http_delivery_urls(self):
+        content = (
+            "证书压缩包已就绪\n"
+            "MEDIA:http://49.233.103.196:9000/certificate-dev/certificate_render_jobs/"
+            "2026/04/22/job-92/file.zip?AWSAccessKeyId=minioadmin&Signature=abc"
+        )
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert len(media) == 1
+        assert media[0][0].startswith("http://49.233.103.196:9000/")
+        assert "证书压缩包已就绪" in cleaned
+
+    def test_media_tag_supports_legacy_word_documents(self):
+        content = "MEDIA:/tmp/archive.doc"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/tmp/archive.doc", False)]
+        assert cleaned == ""
+
+    def test_media_tag_supports_legacy_excel_documents(self):
+        content = "MEDIA:/tmp/archive.xls"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/tmp/archive.xls", False)]
+        assert cleaned == ""
+
+    def test_does_not_treat_media_tag_label_text_as_attachment(self):
+        content = "including any delivery MEDIA: tag produced by the wrapper."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
 
 
 # ---------------------------------------------------------------------------

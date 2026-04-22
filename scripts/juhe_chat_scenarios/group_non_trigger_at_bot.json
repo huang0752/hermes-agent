@@ -1,0 +1,41 @@
+{
+  "name": "group-non-trigger-at-bot",
+  "description": "没有触发权限的群成员即使 @ 机器人，也只会进入上下文池，不会直接触发回复。",
+  "mode": "gateway",
+  "env": {
+    "JUHE_HOME_CHANNEL": "R:3001"
+  },
+  "adapter_extra": {
+    "app_key": "app-key",
+    "app_secret": "app-secret",
+    "guid": "guid-123",
+    "group_policy": "allowlist",
+    "group_allow_from": [
+      "R:3001"
+    ],
+    "trigger_user_ids": [
+      "1001"
+    ],
+    "group_sessions_per_user": false
+  },
+  "steps": [
+    {
+      "name": "non trigger user at bot",
+      "message": {
+        "sender": "2002",
+        "sender_name": "客户李四",
+        "roomid": "3001",
+        "id": "room-msg-at-1",
+        "at_list": [
+          "bot"
+        ],
+        "content": "@bot 这个需求什么时候能排期？"
+      },
+      "expect": {
+        "dispatched": false,
+        "agent_called": false,
+        "room_history_size": 1
+      }
+    }
+  ]
+}
