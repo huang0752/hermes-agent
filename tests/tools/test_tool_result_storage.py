@@ -259,6 +259,41 @@ class TestMaybePersistToolResult:
         assert payload["delivery"]["status"] == "needs_materialization"
         assert "download_url" not in payload
 
+    def test_wrapped_materialized_artifact_result_is_unwrapped_and_sanitized(self):
+        inner_payload = {
+            "status": "completed",
+            "job_id": 95,
+            "delivery": {
+                "filename": "wrapped.zip",
+                "local_path": "/tmp/wrapped.zip",
+                "size": 4096,
+                "media_tag": "MEDIA:/tmp/wrapped.zip",
+            },
+        }
+        content = json.dumps(
+            {
+                "result": json.dumps(inner_payload, ensure_ascii=False),
+                "structuredContent": inner_payload,
+            },
+            ensure_ascii=False,
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="mcp_local_materialize_render_job_artifact",
+            tool_use_id="tool-call-wrapped",
+            env=None,
+            threshold=50_000,
+        )
+        payload = json.loads(result)
+
+        assert "result" not in payload
+        assert "structuredContent" not in payload
+        assert payload["job_id"] == 95
+        assert payload["delivery"]["filename"] == "wrapped.zip"
+        assert "local_path" not in payload["delivery"]
+        assert "media_tag" not in payload["delivery"]
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(

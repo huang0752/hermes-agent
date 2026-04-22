@@ -31,8 +31,41 @@ def _load_json(content: str) -> Any:
         return None
 
 
-def extract_delivery_artifacts(tool_name: str, content: str) -> list[DeliveryArtifact]:
+def _unwrap_tool_payload(content: str) -> Any:
     payload = _load_json(content)
+    current = payload
+
+    for _ in range(4):
+        if not isinstance(current, dict):
+            return current
+
+        structured = current.get("structuredContent")
+        if isinstance(structured, dict):
+            current = structured
+            continue
+        if isinstance(structured, str):
+            parsed = _load_json(structured)
+            if isinstance(parsed, dict):
+                current = parsed
+                continue
+
+        result = current.get("result")
+        if isinstance(result, dict):
+            current = result
+            continue
+        if isinstance(result, str):
+            parsed = _load_json(result)
+            if isinstance(parsed, dict):
+                current = parsed
+                continue
+
+        return current
+
+    return current
+
+
+def extract_delivery_artifacts(tool_name: str, content: str) -> list[DeliveryArtifact]:
+    payload = _unwrap_tool_payload(content)
     if not isinstance(payload, dict):
         return []
 
@@ -60,7 +93,7 @@ def extract_delivery_artifacts(tool_name: str, content: str) -> list[DeliveryArt
 
 
 def sanitize_tool_result_for_model(tool_name: str, content: str) -> str:
-    payload = _load_json(content)
+    payload = _unwrap_tool_payload(content)
     if not isinstance(payload, dict):
         return content
 
